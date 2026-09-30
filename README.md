@@ -1,5 +1,12 @@
-\# 8086/80286 PC Emulator
+<img width="646" height="479" alt="image" src="https://github.com/user-attachments/assets/b87f7a1d-c861-42bf-b779-c354f4568fc1" />
+<img width="636" height="481" alt="image" src="https://github.com/user-attachments/assets/49ad3c76-14d3-4bd8-ba45-544c0ad076d8" />
+<img width="644" height="421" alt="image" src="https://github.com/user-attachments/assets/cc5f6999-dffb-46a8-a3b4-a760db3400ab" />
+<img width="644" height="484" alt="image" src="https://github.com/user-attachments/assets/29e62587-a5b2-4bce-845f-0ca8e165ed2b" />
+it's ONLY can select CGA driver(VGA driver is black screen)
 
+\# 8086/80286 PC Emulator
+WARNING: This binary is NOT statically linked.
+The binary CANNOT be launched by double-clicking.
 
 
 An 8086/80286 PC emulator written in C. Runs BIOS POST, boots DOS,
