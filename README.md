@@ -52,5 +52,5 @@ supports hard disk, floppy, FPU, and 80286 protected mode.
 
 make
 
-./dos86 -bios data/PCXTBIOS.BIN -disk dos.img
+./8086emu -bios data/PCXTBIOS.BIN -disk dos.img
 
