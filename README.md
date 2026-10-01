@@ -43,8 +43,7 @@ supports hard disk, floppy, FPU, and 80286 protected mode.
 
 \- ✅ \*\*PCXTBIOS (Turbo XT BIOS v2.5)\*\* — works
 
-\- ❌ \*\*IBM PC/AT BIOS\*\* — currently fails with a triple fault(cpu fly). \*\*Help wanted.\*\*
-
+\- ❌ \*\*IBM PC/AT BIOS\*\* — currently fails with a triple fault(cpu fly)
 
 
 \## Build
