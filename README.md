@@ -29,7 +29,7 @@ supports hard disk, floppy, FPU, and 80286 protected mode.
 
 \- 8259A PIC, 8253 PIT, 8237 DMA, 8042 keyboard, 8250 serial port
 
-\- CGA text/graphics, NTSC artifact colors (composite video)
+\- VGA text/graphics
 
 \- IDE hard disk, NEC uPD765 floppy controller
 
