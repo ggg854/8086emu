@@ -74,14 +74,12 @@ bool cpu_reset_pending = false;
 
 static int a20_budget = 40;   // TEMP
 void cpu_set_a20(bool on) {
-    if (on != cpu_a20_enabled && a20_budget > 0) {
-        a20_budget--;
-        fprintf(stderr, "[A20] %d->%d @%04X:%04X\n", (int)cpu_a20_enabled, (int)on, cpu.cs, cpu.ip);
-        fflush(stderr);
+    if (on != cpu_a20_enabled) {
+        fprintf(stderr, "[A20] %d->%d @%04X:%04X pe=%d\n",
+                (int)cpu_a20_enabled, (int)on, cpu.cs, cpu.ip, protect.pe);
     }
     cpu_a20_enabled = on;
 }
-
 void cpu_request_reset(void) {
     cpu_reset_pending = true;
 }
@@ -130,7 +128,11 @@ static void seg_cache_commit(int idx, uint16_t sel, uint32_t base, uint32_t limi
 }
 
 void cpu_load_seg_reg(int idx, uint16_t sel) {
-	if (!protect.pe) {
+	if (idx < 0 || idx > 5) {
+        fprintf(stderr, "[SEG] invalid idx=%d @%04X:%04X\n", idx, cpu.cs, cpu.ip);
+        return;
+    }
+    if (!protect.pe) {
 		switch (idx) {
 			case SEG_ES: cpu.es = sel; break;
 			case SEG_CS: cpu.cs = sel; break;
@@ -164,6 +166,11 @@ uint16_t cpu_get_seg_ds(void) {
 }
 
 void cpu_init(void) {
+    fprintf(stderr, "&cpu = %p, size=%zu\n", (void*)&cpu, sizeof(cpu));
+    fprintf(stderr, "&cpu.seg_access[6] = %p (cpu end = %p)\n",
+            (void*)&cpu.seg_access[6], (void*)((char*)&cpu + sizeof(cpu)));
+    fprintf(stderr, "&protect = %p, size=%zu\n", (void*)&protect, sizeof(protect));
+    fprintf(stderr, "&protect.pe = %p\n", (void*)&protect.pe);
     memory = calloc(memory_size, 1);   // 8MB（0x800000）
     memset(&memory[0xF0000], 0xFF, 0x10000);
     cpu386_init();
@@ -1324,21 +1331,31 @@ void cpu_execute_instruction(void) {
             break;
         }
 
-        // MOV r/m16, Sreg (0x8C)
         case 0x8C: {
-            uint8_t modrm = cpu_mem_read(addr + 1);
-            write_modrm16(modrm, *seg_table[(modrm >> 3) & 0x07]);
-            cpu.ip += 2; handle_modrm_ip(modrm);
-            break;
-        }
+    uint8_t modrm = cpu_mem_read(addr + 1);
+    uint8_t reg = (modrm >> 3) & 0x07;
+    if (reg >= 6) {
+        fprintf(stderr, "[MOV-SREG] invalid reg=%d @%04X:%04X\n", reg, cpu.cs, cpu.ip);
+        cpu_invalid_opcode(0x8C);
+        break;
+    }
+    write_modrm16(modrm, *seg_table[reg]);
+    cpu.ip += 2; handle_modrm_ip(modrm);
+    break;
+}
 
-        // MOV Sreg, r/m16 (0x8E) —— 保护模式下必须按描述符校验并填基址缓存
         case 0x8E: {
             uint8_t modrm = cpu_mem_read(addr + 1);
-            uint16_t sel = read_modrm16(modrm);
-            cpu_load_seg_reg(seg_index_tbl[(modrm >> 3) & 0x07], sel);
-            cpu.ip += 2; handle_modrm_ip(modrm);
+            uint8_t reg = (modrm >> 3) & 0x07;
+        if (reg >= 6) {
+            fprintf(stderr, "[MOV-SREG] invalid reg=%d @%04X:%04X\n", reg, cpu.cs, cpu.ip);
+            cpu_invalid_opcode(0x8E);
             break;
+        }
+        uint16_t sel = read_modrm16(modrm);
+        cpu_load_seg_reg(seg_index_tbl[reg], sel);
+        cpu.ip += 2; handle_modrm_ip(modrm);
+        break;
         }
 
         // POP r/m16 (0x8F)

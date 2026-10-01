@@ -21,6 +21,7 @@ SRCS = \
 	src/io/ide.c \
 	src/io/dma.c \
 	src/io/fdc.c \
+	src/main/config.c \
 	src/video/vga.c
 
 OBJS = $(SRCS:.c=.o)
@@ -33,9 +34,8 @@ INCLUDES = \
 	-Isrc/video \
 	-Isrc/main
 
-# GTK 3
-GTK_CFLAGS = $(shell $(PKGCONF) --cflags gtk+-3.0)
-GTK_LIBS   = $(shell $(PKGCONF) --libs gtk+-3.0)
+GTK_CFLAGS = $(shell $(PKGCONF) --cflags gtk+-3.0 json-c)
+GTK_LIBS   = $(shell $(PKGCONF) --libs gtk+-3.0 json-c)
 
 CFLAGS  = -O2 -Wall -Wextra -std=c11 $(INCLUDES) $(GTK_CFLAGS)
 LDFLAGS = $(GTK_LIBS) -lm

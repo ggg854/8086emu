@@ -11,7 +11,7 @@
 #include <string.h>
 #include <signal.h>
 #include <gtk/gtk.h>
-
+#include "config.h"
 volatile bool emu_running = true;
 bool debug_mode = false;
 bool console_mode = false;   // -console：无窗口终端模式（见 dos86.h）
@@ -471,18 +471,15 @@ static gboolean tick(gpointer data) {
     static uint16_t last_cs = 0, last_ip = 0;
     static int same_count = 0;
 
-    // ★ HLT（等中断）状态下设备轮询必须与指令预算无关。
-    //   以前这段逻辑放在 while 循环体里，但 deficit≤0 时 insn_budget=0、循环体一次都不进，
-    //   结果：键盘/FDC/定时器中断永远送不进去，HALT 计数也永远不涨
-    //   （表现就是用户看到的 "cpu_halted=1 却显示 HALT=0"）。
     if (cpu_halted) {
-        if (!halt_reported) {
-            if (debug_mode)
-                printf("\n[HALT] CPU 执行 HLT，等待中断：CS=%04X IP=%04X FL=%04X (IF=%d) HLT累计=%llu\n",
-                       cpu.cs, cpu.ip, cpu.flags, (cpu.flags >> 9) & 1,
-                       (unsigned long long)hlt_count);
-            halt_reported = 1;
-        }
+    if (!halt_reported) {
+        if (debug_mode)
+            printf("\n[HALT] CPU executed HLT, waiting for interrupt: "
+                   "CS=%04X IP=%04X FL=%04X (IF=%d) HLT count=%llu\n",
+                   cpu.cs, cpu.ip, cpu.flags, (cpu.flags >> 9) & 1,
+                   (unsigned long long)hlt_count);
+        halt_reported = 1;
+    }
         io_keyboard_poll();
         io_fdc_poll();
         io_ide_poll();
@@ -499,12 +496,12 @@ static gboolean tick(gpointer data) {
             anchor_us = (uint64_t)now_us;     // 重置锚点，唤醒后不暴补
             anchor_cyc = cpu_cycles;
         } else {
-            if (!console_mode)
-                printf("[HALT] 被中断唤醒，继续执行 CS=%04X IP=%04X\n", cpu.cs, cpu.ip);
-            halt_reported = 0;
+    if (!console_mode)
+        printf("[HALT] woken by interrupt, resuming CS=%04X IP=%04X\n",
+               cpu.cs, cpu.ip);
+    halt_reported = 0;
         }
     }
-
     while (cyc_this_frame < cyc_budget &&
            emu_running && cpu_running) {
 
@@ -533,7 +530,7 @@ static gboolean tick(gpointer data) {
 
         // ★ 检测 1：跑到 IVT 区（只警告 + 停 CPU，不退出）
         if (cpu.cs == 0x0000 && cpu.ip < 0x0400) {
-            fprintf(stderr, "\n[CPU] 跑飞：CS=%04X IP=%04X 落在 IVT 区\n",
+            fprintf(stderr, "\n[CPU] Fly：CS=%04X IP=%04X 落在 IVT 区\n",
                     cpu.cs, cpu.ip);
             fprintf(stderr, "  AX=%04X BX=%04X CX=%04X DX=%04X\n",
                     cpu.ax, cpu.bx, cpu.cx, cpu.dx);
@@ -550,9 +547,9 @@ static gboolean tick(gpointer data) {
         if (cpu.cs == last_cs && cpu.ip == last_ip) {
             same_count++;
             if (same_count > 500000) {
-                printf("\n[CPU] 死循环：CS=%04X IP=%04X 超过 50 万次\n",
+                printf("\n[CPU] Loop：CS=%04X IP=%04X\n",
                        cpu.cs, cpu.ip);
-                printf("  字节: %02X %02X %02X %02X %02X\n",
+                printf("  Byte: %02X %02X %02X %02X %02X\n",
                        cpu_mem_read(addr), cpu_mem_read(addr + 1),
                        cpu_mem_read(addr + 2), cpu_mem_read(addr + 3),
                        cpu_mem_read(addr + 4));
@@ -635,8 +632,8 @@ static gboolean tick(gpointer data) {
         uint64_t dcyc = cpu_cycles - last_cyc;
         uint32_t mhz10 = (uint32_t)(dcyc / 100000);   // 0.1 MHz 精度
         char title[256];
-        const char* st = cpu_halted ? "[HALT 等待中断]"
-                       : (cpu_running ? "[运行中]" : "[已停止 死循环]");
+        const char* st = cpu_halted ? "[HALT (waiting for interrupt)]"
+                       : (cpu_running ? "[Running]" : "[Stopped]");
         snprintf(title, sizeof(title),
                  "IBM PC Emulator - %u.%u MHz  %s  HALT=%d",
                  mhz10 / 10, mhz10 % 10, st, cpu_halted ? 1 : 0,
@@ -757,26 +754,28 @@ char* open_disk_dialog(void) {
 }
 
 // ============================================================
-// 命令行帮助
+// Command-line help
 // ============================================================
 static void print_usage(const char* exe) {
     printf(
-"DOS86 - 8086/8088 PC 模拟器（GTK 前端 / -console 无窗口）\n"
+"IBM PC Emulator - 8086/8088 (GTK frontend / -console headless)\n"
 "\n"
-"用法：%s [选项]\n"
-"不带任何选项直接运行：启动时依次弹出 GTK 选择框挑 BIOS、硬盘、软盘 A:、软盘 B:（取消则用默认值）。\n"
+"Usage: %s [options]\n"
+"With no options: pops up GTK dialogs to select BIOS, hard disk, floppy A:, floppy B:\n"
+"                 (cancel to use defaults).\n"
 "\n"
-"选项：\n"
-"  -help                显示本帮助\n"
-"  -bios <file>         BIOS ROM（默认 data/PCXTBIOS.BIN）\n"
-"  -floppy <file>       软盘 A: 镜像（.img/.ima/.360）\n"
-"  -floppy2 <file>      软盘 B: 镜像\n"
-"  -disk <file>         硬盘镜像（默认 dos.img）\n"
-"  -composite           CGA 复合视频伪色（NTSC artifact colors）\n"
-"  -console             无窗口终端模式\n"
-"  -dbg                 打开调试日志\n"
+"Options:\n"
+"  -help                show this help\n"
+"  -bios <file>         BIOS ROM (default: data/PCXTBIOS.BIN)\n"
+"  -floppy <file>       floppy A: image (.img/.ima/.360)\n"
+"  -floppy2 <file>      floppy B: image\n"
+"  -disk <file>         hard disk image (default: dos.img)\n"
+"  -composite           CGA composite artifact colors (NTSC)\n"
+"  -console             headless terminal mode\n"
+"  -dbg                 enable debug log\n"
 "\n"
-"运行中用窗口顶部「机器」菜单换 A:/B: 软盘、重启；用「频率」菜单切换客机主频。\n", exe);
+"At runtime: use the 'Machine' menu to swap floppies A:/B: or reset;\n"
+"            use the 'Frequency' menu to change the emulated CPU clock.\n", exe);
 }
 
 // 默认 BIOS：按顺序找 data/PCXTBIOS.BIN
@@ -796,13 +795,13 @@ static const char* find_default_bios(void) {
 void ui_mount_floppy(int drive) {
     if (console_mode) return;
     GtkWidget* dialog = gtk_file_chooser_dialog_new(
-        drive ? "挂载软盘 B:" : "挂载软盘 A:",
+        drive ? "Mount B:" : "Mount A:",
         NULL, GTK_FILE_CHOOSER_ACTION_OPEN,
-        "_取消", GTK_RESPONSE_CANCEL,
-        "_挂载", GTK_RESPONSE_ACCEPT, NULL);
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Accept", GTK_RESPONSE_ACCEPT, NULL);
 
     GtkFileFilter* filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "软盘镜像 (*.img, *.ima, *.360, *.144)");
+    gtk_file_filter_set_name(filter, "Floppy Images (*.img, *.ima, *.360, *.144)");
     gtk_file_filter_add_pattern(filter, "*.img");
     gtk_file_filter_add_pattern(filter, "*.ima");
     gtk_file_filter_add_pattern(filter, "*.360");
@@ -810,7 +809,7 @@ void ui_mount_floppy(int drive) {
     gtk_file_filter_add_pattern(filter, "*.IMG");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
     GtkFileFilter* all = gtk_file_filter_new();
-    gtk_file_filter_set_name(all, "所有文件");
+    gtk_file_filter_set_name(all, "All Files");
     gtk_file_filter_add_pattern(all, "*");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), all);
 
@@ -841,86 +840,31 @@ void ui_reset_machine(void) {
     cpu_reset();
     vga_reset();
     vga_video_rom_install();     // 清 RAM 会把 C000 段的显卡选件 ROM 冲掉，必须重装
-    printf("[RESET] 机器已复位，重新 POST …\n");
+    
 }
 
-// ============================================================
-// init_emulator
-// ============================================================
-void init_emulator(int argc, char** argv) {
-    // 1) CPU 内存 + 复位
+void init_emulator(const Config* cfg) {
     cpu_init();
 
-    // 2) VGA + GTK（gtk_init 在里面）；-console 下不建窗口
-    if (console_mode) vga_set_headless(true);
-    vga_init(argc, argv);
+    if (cfg->console) vga_set_headless(true);
+    vga_init(0, NULL);   // 注意：gtk_init 已经在 main 里调了
 
-    // 3) BIOS ROM：只在启动时选（运行中不可改）。
-    //    -bios 指定优先；否则弹 GTK 选择框，取消/失败则用默认 data/PCXTBIOS.BIN
-    char* bios_file = NULL;
-    for (int i = 1; i < argc - 1; i++) {
-        if (strcmp(argv[i], "-bios") == 0) {
-            bios_file = argv[i + 1];
-            break;
-        }
-    }
-    if (!bios_file && !console_mode) bios_file = open_bios_dialog();
-    if (!bios_file) bios_file = (char*)find_default_bios();
-    if (bios_file) {
-        load_bios(bios_file);
-    } else {
-        printf("[BIOS] 找不到 BIOS ROM，请把 PCXTBIOS.BIN 放到 data/ 下，或用 -bios 指定\n");
-    }
+    if (cfg->bios[0]) load_bios(cfg->bios);
+    else printf("[BIOS] no BIOS specified\n");
 
-    // 3b) 显卡选件 ROM：DIP 报 EGA/VGA 时 BIOS 不提供 INT 10h，
-    //     靠 C000 段这块 ROM 在选件扫描里把 INT 10h 指回 BIOS 自带的处理程序
     vga_video_rom_install();
-
-    // 4) IDE 初始化（自动挂 dos.img）
     ide_init();
+    if (cfg->disk[0]) ide_mount_disk(cfg->disk);
+    ide_mount_floppy(0, cfg->floppy_a[0] ? cfg->floppy_a : NULL);
+    ide_mount_floppy(1, cfg->floppy_b[0] ? cfg->floppy_b : NULL);
 
-    // 5) 硬盘镜像：-disk 指定；GTK 模式下未指定则弹选择框（取消沿用 dos.img）
-    char* disk_file = NULL;
-    for (int i = 1; i < argc - 1; i++) {
-        if (strcmp(argv[i], "-disk") == 0) {
-            disk_file = argv[i + 1];
-            break;
-        }
-    }
-    if (!disk_file && !console_mode) disk_file = open_disk_dialog();
-    if (disk_file) {
-        ide_mount_disk(disk_file);
-    }
-
-    // 6) 软盘镜像：A: 用 -floppy；没指定就直接弹 GTK 文件选择框让你自己挑，
-    //    运行中还能用窗口顶部按钮随时换盘
-    char* floppy_file = NULL;
-    for (int i = 1; i < argc - 1; i++) {
-        if (strcmp(argv[i], "-floppy") == 0) {
-            floppy_file = argv[i + 1];
-            break;
-        }
-    }
-    if (!floppy_file && !console_mode) floppy_file = open_floppy_dialog(0);
-    ide_mount_floppy(0, floppy_file);   // NULL 也行，会挂空白软盘
-
-    char* floppy2_file = NULL;
-    for (int i = 1; i < argc - 1; i++) {
-        if (strcmp(argv[i], "-floppy2") == 0) {
-            floppy2_file = argv[i + 1];
-            break;
-        }
-    }
-    if (!floppy2_file && !console_mode) floppy2_file = open_floppy_dialog(1);
-    ide_mount_floppy(1, floppy2_file);  // NULL 也行，会挂空白软盘
-
-    // 7) 清屏
     vga_clear(0x07);
+    vga_set_composite(cfg->composite);
+    cpu_clk_hz = (uint32_t)(cfg->cpu_mhz ? cfg->cpu_mhz : 20) * 1000000;
 
-    // -console：没有窗口，GTK 信号一律不接
-    if (console_mode) return;
+    if (cfg->console) return;
 
-    // 8) 键盘信号
+    // GTK 信号
     g_signal_connect(vga.window, "key-press-event",
                      G_CALLBACK(vga_on_key_press), NULL);
     g_signal_connect(vga.window, "key-release-event",
@@ -929,16 +873,12 @@ void init_emulator(int argc, char** argv) {
                      G_CALLBACK(vga_on_key_press), NULL);
     g_signal_connect(vga.drawing_area, "key-release-event",
                      G_CALLBACK(vga_on_key_release), NULL);
-
-    // 8b) 鼠标信号：点画布捕获（相对位移/按键），Ctrl+Alt+← 释放
     g_signal_connect(vga.drawing_area, "motion-notify-event",
                      G_CALLBACK(vga_on_motion), NULL);
     g_signal_connect(vga.drawing_area, "button-press-event",
                      G_CALLBACK(vga_on_button_press), NULL);
     g_signal_connect(vga.drawing_area, "button-release-event",
                      G_CALLBACK(vga_on_button_release), NULL);
-
-    // 9) 窗口关闭
     g_signal_connect(vga.window, "delete-event",
                      G_CALLBACK(on_delete_event), NULL);
     g_signal_connect(vga.window, "destroy",
@@ -950,7 +890,7 @@ void init_emulator(int argc, char** argv) {
 int main(int argc, char* argv[]) {
     setbuf(stdout, NULL);
 
-    // -help：打印用法后直接退出（不建窗口）
+    // -help
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "--help") == 0 ||
             strcmp(argv[i], "-h") == 0) {
@@ -959,30 +899,46 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // -console 必须在 init_emulator 之前定下来：它决定要不要建 GTK 窗口；
-    // 同时按用户要求，有 -console 就关掉 -dbg 日志
-    bool composite_mode = false;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-console") == 0) console_mode = true;
-        if (strcmp(argv[i], "-composite") == 0) composite_mode = true;
+    // -config <path>
+    const char* config_path = "config.json";
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "-config") == 0) {
+            config_path = argv[i + 1];
+            break;
+        }
     }
-    // -console 下默认关日志（别打到屏幕上）；设了 DOS86_TRACE 才打开，便于无窗口排错
-    if (console_mode) debug_mode = getenv("DOS86_TRACE") != NULL;
 
-    printf(console_mode ? "80386 Emulator (console, BIOS boot)\n\n"
-                        : "80386 Emulator (GTK, BIOS boot)\n\n");
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
 
-    init_emulator(argc, argv);
-    if (composite_mode) vga_set_composite(true);
+    // 先 gtk_init（配置窗口需要）
+    gtk_init(&argc, &argv);
 
-    // 参数解析：-dbg 打开调试日志（-console 下不生效）
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-dbg") == 0 && !console_mode) debug_mode = true;
+    // 尝试加载配置
+    bool loaded = config_load(config_path, &cfg);
+
+    // 弹配置窗口（不管有没有配置文件，都弹）
+    if (!config_dialog(&cfg)) {
+        printf("Cancelled.\n");
+        return 0;
     }
+
+    // 保存
+    if (config_save(config_path, &cfg))
+        printf("[CONFIG] saved to %s\n", config_path);
+    else
+        fprintf(stderr, "[CONFIG] failed to save %s\n", config_path);
+
+    printf("IBM PC Emulator\n\n");
+
+    // 启动
+    if (cfg.console) console_mode = true;
+    debug_mode = cfg.debug;
+
+    init_emulator(&cfg);
 
     if (console_mode) {
-        // ---- 终端模式：自己跑主循环（没有 GTK 事件循环）----
-        printf("[CONSOLE] 终端模式（-console）：屏幕画在本终端，Ctrl+C 退出\n");
+        printf("[CONSOLE] terminal mode, Ctrl+C to quit\n");
         fputs("\x1b[2J\x1b[H", stdout);
         memset(con_shadow, 0, sizeof(con_shadow));
         g_thread_new("con-in", con_reader, NULL);
@@ -990,27 +946,16 @@ int main(int argc, char* argv[]) {
             tick(NULL);
             con_poll_input();
             con_render();
-            g_usleep(1000);          // 1ms 一拍，足够喂满 20MHz，也不烧 CPU
+            g_usleep(1000);
         }
         printf("\nEmulator stopped.\n");
-        ide_cleanup();               // 把硬盘/软盘的改动写回镜像
+        ide_cleanup();
         return 0;
     }
 
-    // ★ 模拟心跳用 idle 驱动，不再用周期超时。
-    //   原因：g_timeout_add 的 16ms 是"从回调被派发那一刻"起算的绝对时间，tick() 每帧
-    //   要跑满 12ms 模拟，于是实际周期变成 28ms 以上；加上 Windows 上 GTK 主循环的调度，
-    //   实测 tick() 每秒只被调用 10~23 次（应 ~62 次），速度只剩应有的 1/4，读盘一起慢。
-    //   idle 源在按键事件(优先级 0)和重绘(120)之后运行，回调返回 TRUE 就立刻重新排队，
-    //   tick() 内部按"实际经过时间"发指令配额，所以速度稳定锁在 20MHz，且不会饿死重绘。
     g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, tick, NULL, NULL);
-
-    // ★ 关键：只要用户没点 ×，gtk_main 返回了就重新跑
-    while (emu_running) {
-        gtk_main();
-    }
-
+    while (emu_running) gtk_main();
     printf("Emulator stopped.\n");
-    ide_cleanup();                   // 把硬盘/软盘的改动写回镜像
+    ide_cleanup();
     return 0;
 }

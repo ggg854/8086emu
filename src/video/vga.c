@@ -9,7 +9,15 @@
 #include <stdio.h>
 
 VGA vga;
+// VGA 位平面显存
+uint8_t vga_planes[4][VGA_PLANE_SIZE] = {0};
 
+// VGA 端口寄存器
+uint8_t vga_seq_regs[8] = {0};
+uint8_t vga_gc_regs[16] = {0};
+uint8_t vga_attr_regs[0x20] = {0};
+uint8_t vga_attr_palette[16] = {0, 1, 2, 3, 4, 5, 6, 7,
+                                8, 9, 10, 11, 12, 13, 14, 15};
 extern bool debug_mode;   // 主程序 -dbg 打开
 extern void ui_mount_floppy(int drive);   // 主程序：运行时换盘（弹文件框 + 挂载）
 extern void ui_reset_machine(void);       // 主程序：复位机器（重新 POST）
@@ -296,7 +304,7 @@ void vga_init(int argc, char** argv) {
     return;
   }
 
-  gtk_init(&argc, &argv);
+  
 
   vga.mode = MODE_TEXT_80x25;
   vga.width = 640;
@@ -306,7 +314,7 @@ void vga_init(int argc, char** argv) {
   vga.cursor_visible = true;
 
   vga.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-  gtk_window_set_title(GTK_WINDOW(vga.window), "DOS86 Emulator");
+  gtk_window_set_title(GTK_WINDOW(vga.window), "IBM PC Emulator");
   gtk_window_set_default_size(GTK_WINDOW(vga.window), vga.width, vga.height + LED_BAR_H);
   // 焦点不在绘图区时（点了窗口边框/标题栏）也要能收到按键
   gtk_widget_add_events(vga.window,
@@ -329,12 +337,12 @@ void vga_init(int argc, char** argv) {
   GtkWidget* menubar = gtk_menu_bar_new();
 
   // ---- 「机器」菜单 ----
-  GtkWidget* mi_machine   = gtk_menu_item_new_with_label("机器");
+  GtkWidget* mi_machine   = gtk_menu_item_new_with_label("Machine");
   GtkWidget* menu_machine = gtk_menu_new();
   gtk_menu_item_set_submenu(GTK_MENU_ITEM(mi_machine), menu_machine);
-  GtkWidget* it_a = gtk_menu_item_new_with_label("切换软盘 A:");
-  GtkWidget* it_b = gtk_menu_item_new_with_label("切换软盘 B:");
-  GtkWidget* it_r = gtk_menu_item_new_with_label("重启");
+  GtkWidget* it_a = gtk_menu_item_new_with_label("Change Floppy A:");
+  GtkWidget* it_b = gtk_menu_item_new_with_label("Change Floppy B:");
+  GtkWidget* it_r = gtk_menu_item_new_with_label("Restart");
   gtk_menu_shell_append(GTK_MENU_SHELL(menu_machine), it_a);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu_machine), it_b);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu_machine), gtk_separator_menu_item_new());
@@ -345,7 +353,7 @@ void vga_init(int argc, char** argv) {
   gtk_menu_shell_append(GTK_MENU_SHELL(menubar), mi_machine);
 
   // ---- 「频率」菜单（单选，默认勾上当前主频）----
-  GtkWidget* mi_freq   = gtk_menu_item_new_with_label("频率");
+  GtkWidget* mi_freq   = gtk_menu_item_new_with_label("Frequency");
   GtkWidget* menu_freq = gtk_menu_new();
   gtk_menu_item_set_submenu(GTK_MENU_ITEM(mi_freq), menu_freq);
   GSList* freq_group = NULL;
@@ -408,6 +416,7 @@ void vga_cleanup(void) {
 // ============================================================
 void vga_set_mode(VideoMode mode) {
   vga.mode = mode;
+  fprintf(stderr, "[VGA] set_mode %d\n", mode);
   switch (mode) {
     case MODE_TEXT_80x25: vga.width = 640; vga.height = 400; break;
     case MODE_TEXT_40x25: vga.width = 320; vga.height = 400; break;
@@ -539,267 +548,426 @@ static void comp_prepare(void) {
   comp_v_ready = true;
 }
 
-// 由一行"直接色索引"算出第 p 个输出像素的复合色（0xRRGGBB）。
-//   spp = 每个像素占几个 14.318MHz 采样（640 宽模式 = 1，320 宽模式 = 2）
+// 伪色+ 增强参数（直接写死，改这里调效果）
+#define COMP_SAT  1.30f   // 色度增益：1.0=原版，>1 更艳
+#define COMP_CON  1.10f   // 对比度：1.0=原版
+#define COMP_BRI  0.00f   // 亮度偏移：0.0=原版
+
 static uint32_t comp_px(const uint8_t* idx, int w, int spp, int p) {
-  int v[4], ph[4];
-  int lim = w * spp - 1;
-  for (int k = 0; k < 4; k++) {
-    int s = p * spp + k;
-    if (s < 0) s = 0;
-    if (s > lim) s = lim;
-    int pi = s / spp;
-    if (pi >= w) pi = w - 1;
-    ph[k] = s & 3;
-    v[k] = comp_v[idx[pi]][ph[k]];
-  }
-  int y  = (v[0] + v[1] + v[2] + v[3] + 2) >> 2;   // 亮度 = 四采样均值（色度在一个周期内互相抵消）
-  int ii = (v[0] * ct[ph[0]] + v[1] * ct[ph[1]] + v[2] * ct[ph[2]] + v[3] * ct[ph[3]]) / 2;
-  int qq = (v[0] * st[ph[0]] + v[1] * st[ph[1]] + v[2] * st[ph[2]] + v[3] * st[ph[3]]) / 2;
-  int r = y + ( 956 * ii + 621 * qq) / 2000;
-  int g = y + (-272 * ii - 647 * qq) / 2000;
-  int b = y + (-1106 * ii + 1703 * qq) / 2000;
-  if (r < 0) r = 0; else if (r > 255) r = 255;
-  if (g < 0) g = 0; else if (g > 255) g = 255;
-  if (b < 0) b = 0; else if (b > 255) b = 255;
-  return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    int v[4], ph[4];
+    int lim = w * spp - 1;
+    for (int k = 0; k < 4; k++) {
+        int s = p * spp + k;
+        if (s < 0) s = 0;
+        if (s > lim) s = lim;
+        int pi = s / spp;
+        if (pi >= w) pi = w - 1;
+        ph[k] = s & 3;
+        v[k] = comp_v[idx[pi]][ph[k]];
+    }
+
+    int y  = (v[0] + v[1] + v[2] + v[3] + 2) >> 2;
+    int ii = (v[0] * ct[ph[0]] + v[1] * ct[ph[1]] +
+              v[2] * ct[ph[2]] + v[3] * ct[ph[3]]) / 2;
+    int qq = (v[0] * st[ph[0]] + v[1] * st[ph[1]] +
+              v[2] * st[ph[2]] + v[3] * st[ph[3]]) / 2;
+
+    // ★ 伪色+ 增强
+    ii = (int)(ii * COMP_SAT);
+    qq = (int)(qq * COMP_SAT);
+    y  = (int)((y - 128) * COMP_CON + 128 + COMP_BRI * 255.0f);
+
+    int r = y + ( 956 * ii + 621 * qq) / 2000;
+    int g = y + (-272 * ii - 647 * qq) / 2000;
+    int b = y + (-1106 * ii + 1703 * qq) / 2000;
+
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+// ============================================================
+// VGA 位平面显存读写（模式 12h 用）
+// ============================================================
+void vga_mem_write(uint32_t off, uint8_t val) {
+    if (off >= VGA_PLANE_SIZE) return;
+
+    uint8_t plane_mask = vga_seq_regs[2];        // 序列器 reg2：写哪些 plane
+    uint8_t bit_mask   = vga_gc_regs[8];          // GC reg8：位掩码
+    uint8_t set_reset  = vga_gc_regs[0];          // GC reg0：置位复位
+    uint8_t en_sr      = vga_gc_regs[1];          // GC reg1：允许置位复位
+    uint8_t rotate     = vga_gc_regs[3] & 0x07;   // GC reg3 低 3 位：数据循环
+    uint8_t logic_op   = (vga_gc_regs[3] >> 3) & 0x03;
+    uint8_t write_mode = vga_gc_regs[5] & 0x03;   // GC reg5 低 2 位：写模式
+
+    // 如果 plane_mask 是 0（驱动没设），默认写全部 plane
+    if (plane_mask == 0) plane_mask = 0x0F;
+    // 如果 bit_mask 是 0（驱动没设），默认全部位
+    if (bit_mask == 0) bit_mask = 0xFF;
+
+    uint8_t data = val;
+    if (rotate) data = (uint8_t)((data >> rotate) | (data << (8 - rotate)));
+
+    for (int p = 0; p < 4; p++) {
+        if (!(plane_mask & (1 << p))) continue;
+        uint8_t old = vga_planes[p][off];
+        uint8_t newb;
+        switch (write_mode) {
+            case 0: {   // 写模式 0：普通写
+                uint8_t src = (en_sr & (1 << p))
+                              ? ((set_reset & (1 << p)) ? 0xFF : 0x00)
+                              : data;
+                newb = (uint8_t)((old & ~bit_mask) | (src & bit_mask));
+                switch (logic_op) {
+                    case 0: newb = newb; break;
+                    case 1: newb = (uint8_t)(old & newb); break;
+                    case 2: newb = (uint8_t)(old | newb); break;
+                    case 3: newb = (uint8_t)(old ^ newb); break;
+                }
+                break;
+            }
+            case 1:     // 写模式 1：锁存器写
+                newb = (uint8_t)(old & bit_mask);
+                break;
+            case 2: {   // 写模式 2：位扩展
+                newb = 0;
+                for (int b = 0; b < 8; b++)
+                    if (data & (1 << b)) newb |= (1 << b);
+                newb = (uint8_t)((old & ~bit_mask) | (newb & bit_mask));
+                break;
+            }
+            case 3: {   // 写模式 3：置位复位
+                newb = (en_sr & (1 << p))
+                       ? ((set_reset & (1 << p)) ? 0xFF : 0x00)
+                       : old;
+                newb = (uint8_t)((old & ~bit_mask) | (newb & bit_mask));
+                break;
+            }
+            default: newb = old; break;
+        }
+        vga_planes[p][off] = newb;
+    }
 }
 
+uint8_t vga_mem_read(uint32_t off) {
+    if (off >= VGA_PLANE_SIZE) return 0xFF;
+    uint8_t read_map = vga_gc_regs[4] & 0x03;
+    return vga_planes[read_map][off];
+}
+// 在 VGA 屏幕正中心画一行字（黑底 #AAAAAA 前景）
+static void draw_centered_message(const char* msg) {
+    if (!vga.pixels) return;
+    int len = (int)strlen(msg);
+    int text_w = len * 8;
+    int text_h = 16;
+    int start_x = (vga.width  - text_w) / 2;
+    int start_y = (vga.height - text_h) / 2;
+    if (start_x < 0) start_x = 0;
+    if (start_y < 0) start_y = 0;
+
+    const uint32_t bg = 0x000000;   // 黑底
+    const uint32_t fg = 0xAAAAAA;   // #AAAAAA 前景
+
+    // 黑底（含 2 像素边距）
+    for (int y = start_y - 2; y < start_y + text_h + 2; y++) {
+        if (y < 0 || y >= vga.height) continue;
+        for (int x = start_x - 2; x < start_x + text_w + 2; x++) {
+            if (x < 0 || x >= vga.width) continue;
+            vga.pixels[y * vga.width + x] = bg;
+        }
+    }
+
+    // 前景字
+    for (int i = 0; i < len; i++) {
+        uint8_t ch = (uint8_t)msg[i];
+        if (ch < 32 || ch > 127) ch = '?';
+        for (int y = 0; y < 16; y++) {
+            uint8_t bits = font8x16[ch][y];
+            for (int x = 0; x < 8; x++) {
+                int px = start_x + i * 8 + x;
+                int py = start_y + y;
+                if (px < 0 || px >= vga.width || py < 0 || py >= vga.height) continue;
+                vga.pixels[py * vga.width + px] =
+                    (bits & (0x80 >> x)) ? fg : bg;
+            }
+        }
+    }
+}
 // ============================================================
-// 渲染
+// 完整渲染
 // ============================================================
 bool vga_render(void) {
-  if (!vga.pixels || !vga.surface) return false;
+    if (!vga.pixels || !vga.surface) return false;
 
-  // ---------- 文本模式 ----------
-  if (vga.mode == MODE_TEXT_80x25 || vga.mode == MODE_TEXT_40x25) {
-    int cols = (vga.mode == MODE_TEXT_80x25) ? 80 : 40;
+    const uint32_t W = (uint32_t)vga.width;
+    uint32_t* __restrict px = vga.pixels;
 
-    // 显存和光标闪烁状态都没变 -> 直接跳过，避免每帧重画 640x400
-    int blink = (int)((g_get_monotonic_time() / 500000) % 2);
-    if (text_shadow_valid && blink == text_last_blink &&
-        memcmp(text_shadow, &memory[CGA_TEXT_ADDR], TEXT_SHADOW_SIZE) == 0) {
-      return false;
-    }
-    memcpy(text_shadow, &memory[CGA_TEXT_ADDR], TEXT_SHADOW_SIZE);
-    text_shadow_valid = true;
-    text_last_blink = blink;
+    // ------------------------------------------------------------
+    // 文本模式 80x25 / 40x25
+    // ------------------------------------------------------------
+    if (vga.mode == MODE_TEXT_80x25 || vga.mode == MODE_TEXT_40x25) {
+        int cols = (vga.mode == MODE_TEXT_80x25) ? 80 : 40;
 
-    // 黑底
-    for (int i = 0; i < vga.width * vga.height; i++) {
-      vga.pixels[i] = 0x000000;
-    }
-
-    if (cga_composite) {
-      // 复合伪色：按 14.318MHz 采样解调。80 列 = 每像素 1 采样，40 列 = 2 采样。
-      comp_prepare();
-      int w = cols * 8;
-      int spp = (cols == 80) ? 1 : 2;
-      static uint8_t  idx[640];
-      static uint32_t line[640];
-      for (int row = 0; row < 25; row++) {
-        for (int y = 0; y < 16; y++) {
-          for (int col = 0; col < cols; col++) {
-            int offset = (row * 80 + col) * 2;
-            uint8_t ch = memory[CGA_TEXT_ADDR + offset];
-            uint8_t attr = memory[CGA_TEXT_ADDR + offset + 1];
-            uint8_t fg = attr & 0x0F;
-            uint8_t bg = (attr >> 4) & 0x07;
-            uint8_t bits = font8x16[ch][y];
-            for (int x = 0; x < 8; x++)
-              idx[col * 8 + x] = (bits & (0x80 >> x)) ? fg : bg;
-          }
-          for (int x = 0; x < w; x++) line[x] = comp_px(idx, w, spp, x);
-          // 8x16 字模：一条扫描线对一条屏幕扫描线
-          int dy = row * 16 + y;
-          memcpy(&vga.pixels[dy * vga.width], line, (size_t)w * 4);
+        int blink = (int)((g_get_monotonic_time() / 500000) % 2);
+        if (text_shadow_valid && blink == text_last_blink &&
+            memcmp(text_shadow, &memory[CGA_TEXT_ADDR], TEXT_SHADOW_SIZE) == 0) {
+            return false;
         }
-      }
-    } else {
-      for (int row = 0; row < 25; row++) {
-        for (int col = 0; col < cols; col++) {
-          int offset = (row * 80 + col) * 2;
-          uint8_t ch = memory[CGA_TEXT_ADDR + offset];
-          uint8_t attr = memory[CGA_TEXT_ADDR + offset + 1];
-          uint8_t fg = attr & 0x0F;
-          uint8_t bg = (attr >> 4) & 0x07;
+        memcpy(text_shadow, &memory[CGA_TEXT_ADDR], TEXT_SHADOW_SIZE);
+        text_shadow_valid = true;
+        text_last_blink = blink;
 
-          RGBColor fgc = vga_palette[fg];
-          RGBColor bgc = vga_palette[bg];
+        for (uint32_t i = 0; i < W * (uint32_t)vga.height; i++) px[i] = 0x000000;
 
-          uint32_t fg32 = (fgc.r << 16) | (fgc.g << 8) | fgc.b;
-          uint32_t bg32 = (bgc.r << 16) | (bgc.g << 8) | bgc.b;
-
-          uint8_t* font = font8x16[ch];
-          int px = col * 8;
-          int py = row * 16;
-
-          for (int y = 0; y < 16; y++) {
-            uint8_t bits = font[y];
-            for (int x = 0; x < 8; x++) {
-              uint32_t c = (bits & (0x80 >> x)) ? fg32 : bg32;
-              vga.pixels[(py + y) * vga.width + px + x] = c;
+        if (cga_composite) {
+            comp_prepare();
+            int w = cols * 8;
+            int spp = (cols == 80) ? 1 : 2;
+            static uint8_t  idx[640];
+            static uint32_t line[640];
+            for (int row = 0; row < 25; row++) {
+                for (int y = 0; y < 16; y++) {
+                    for (int col = 0; col < cols; col++) {
+                        int offset = (row * 80 + col) * 2;
+                        uint8_t ch   = memory[CGA_TEXT_ADDR + offset];
+                        uint8_t attr = memory[CGA_TEXT_ADDR + offset + 1];
+                        uint8_t fg = attr & 0x0F;
+                        uint8_t bg = (attr >> 4) & 0x07;
+                        uint8_t bits = font8x16[ch][y];
+                        uint8_t* dst = &idx[col * 8];
+                        for (int x = 0; x < 8; x++)
+                            dst[x] = (bits & (0x80 >> x)) ? fg : bg;
+                    }
+                    for (int x = 0; x < w; x++) line[x] = comp_px(idx, w, spp, x);
+                    int dy = row * 16 + y;
+                    memcpy(&px[dy * W], line, (size_t)w * 4);
+                }
             }
-          }
-        }
-      }
-    }
-
-    // ★ 闪烁光标（500ms 周期）：位置/形状取自 BIOS 写进 BDA 的值
-    //   0x450 + page*2 = 光标位置 word，BIOS 用 MOV [0050],DX 写入，
-    //   即低字节 = 列(DL)、高字节 = 行(DH)；0x462 = 当前显示页
-    //   0x460 = 光标形状（仅用 bit5 判断是否关闭）
-    //   形状固定：8x16 字符单元最下方两条扫描线（下划线）
-    int page = memory[0x462] & 0x07;
-    int cx = memory[0x450 + page * 2];       // 低字节 = 列
-    int cy = memory[0x450 + page * 2 + 1];   // 高字节 = 行
-    if (!(memory[0x460] & 0x20) && cx < cols && cy < 25) {
-      gint64 now = g_get_monotonic_time();
-      bool blink_on = ((now / 500000) % 2) == 0;
-      if (blink_on) {
-        int px = cx * 8, py = cy * 16;
-        for (int y = 14; y <= 15; y++) {
-          for (int x = 0; x < 8; x++) {
-            int idx = (py + y) * vga.width + (px + x);
-            if (idx >= 0 && idx < vga.width * vga.height) {
-              vga.pixels[idx] = 0xAAAAAA;
-            }
-          }
-        }
-      }
-    }
-  }
-  // ---------- 图形模式 320x200x256 ----------
-  else if (vga.mode == MODE_GFX_320x200) {
-    for (int y = 0; y < 200; y++) {
-      for (int x = 0; x < 320; x++) {
-        uint8_t pixel = memory[VGA_GFX_ADDR + y * 320 + x];
-        uint8_t r6 = vga_palette_256[pixel][0];
-        uint8_t g6 = vga_palette_256[pixel][1];
-        uint8_t b6 = vga_palette_256[pixel][2];
-        uint8_t r = (r6 << 2) | (r6 >> 4);
-        uint8_t g = (g6 << 2) | (g6 >> 4);
-        uint8_t b = (b6 << 2) | (b6 >> 4);
-        vga.pixels[y * vga.width + x] = (r << 16) | (g << 8) | b;
-      }
-    }
-  }
-  // ---------- 图形模式 640x480x16 ----------
-  else if (vga.mode == MODE_GFX_640x480) {
-    for (int y = 0; y < 480; y++) {
-      for (int x = 0; x < 640; x += 2) {
-        uint8_t byte = memory[VGA_GFX_ADDR + y * 320 + x / 2];
-        uint8_t hi = (byte >> 4) & 0x0F;
-        uint8_t lo = byte & 0x0F;
-        RGBColor c1 = vga_palette[hi];
-        RGBColor c2 = vga_palette[lo];
-        vga.pixels[y * vga.width + x] =
-          (c1.r << 16) | (c1.g << 8) | c1.b;
-        vga.pixels[y * vga.width + x + 1] =
-          (c2.r << 16) | (c2.g << 8) | c2.b;
-      }
-    }
-  }
-
-  // ---------- CGA 320x200 四色（模式 4/5）：2bpp，双 bank 交错，2x2 放大 ----------
-  else if (vga.mode == MODE_CGA_320x200) {
-    RGBColor bgc = vga_palette[cga_color_reg & 0x0F];
-    uint32_t bg = (bgc.r << 16) | (bgc.g << 8) | bgc.b;
-    uint32_t pal[4];
-    if (cga_bw) {
-      // 黑白模式（0x3D8 bit2）：0=背景/黑，1=白
-      pal[0] = bg;
-      pal[1] = pal[2] = pal[3] = 0xFFFFFF;
-    } else {
-      cga_get_palette4(pal, bg);
-    }
-
-    for (int y = 0; y < 200; y++) {
-      int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
-      int dy = y * 2;
-      if (cga_composite) {
-        // 复合伪色：320 宽模式下 1 个像素 = 2 个 14.318MHz 采样
-        comp_prepare();
-        static uint8_t  idx[320];
-        static uint32_t line[320];
-        uint8_t pidx[4];
-        pidx[0] = cga_color_reg & 0x0F;
-        if (cga_bw) {
-          pidx[1] = pidx[2] = pidx[3] = 15;
         } else {
-          static const uint8_t p0[3] = { 2, 4, 6 };
-          static const uint8_t p1[3] = { 3, 5, 7 };
-          for (int i = 0; i < 3; i++) {
-            uint8_t v = (cga_color_reg & 0x20) ? p1[i] : p0[i];
-            if (cga_color_reg & 0x10) v |= 0x08;
-            pidx[i + 1] = v;
-          }
+            for (int row = 0; row < 25; row++) {
+                for (int col = 0; col < cols; col++) {
+                    int offset = (row * 80 + col) * 2;
+                    uint8_t ch   = memory[CGA_TEXT_ADDR + offset];
+                    uint8_t attr = memory[CGA_TEXT_ADDR + offset + 1];
+                    uint8_t fg = attr & 0x0F;
+                    uint8_t bg = (attr >> 4) & 0x07;
+                    RGBColor fgc = vga_palette[fg];
+                    RGBColor bgc = vga_palette[bg];
+                    uint32_t fg32 = (fgc.r << 16) | (fgc.g << 8) | fgc.b;
+                    uint32_t bg32 = (bgc.r << 16) | (bgc.g << 8) | bgc.b;
+                    const uint8_t* font = font8x16[ch];
+                    int px0 = col * 8, py = row * 16;
+                    for (int y = 0; y < 16; y++) {
+                        uint8_t bits = font[y];
+                        uint32_t* dst = &px[(py + y) * W + px0];
+                        for (int x = 0; x < 8; x++)
+                            dst[x] = (bits & (0x80 >> x)) ? fg32 : bg32;
+                    }
+                }
+            }
         }
-        for (int x = 0; x < 320; x++) {
-          uint8_t b = memory[base + (x >> 2)];
-          idx[x] = pidx[(b >> ((3 - (x & 3)) * 2)) & 3];
-        }
-        for (int x = 0; x < 320; x++) line[x] = comp_px(idx, 320, 2, x);
-        for (int x = 0; x < 320; x++) {
-          uint32_t c = line[x];
-          int dx = x * 2;
-          vga.pixels[dy * 640 + dx]           = c;
-          vga.pixels[dy * 640 + dx + 1]       = c;
-          vga.pixels[(dy + 1) * 640 + dx]     = c;
-          vga.pixels[(dy + 1) * 640 + dx + 1] = c;
-        }
-        continue;
-      }
-      for (int x = 0; x < 320; x++) {
-        uint8_t b = memory[base + (x >> 2)];
-        uint32_t c = pal[(b >> ((3 - (x & 3)) * 2)) & 3];
-        int dx = x * 2;
-        vga.pixels[dy * 640 + dx]         = c;
-        vga.pixels[dy * 640 + dx + 1]     = c;
-        vga.pixels[(dy + 1) * 640 + dx]   = c;
-        vga.pixels[(dy + 1) * 640 + dx + 1] = c;
-      }
-    }
-  }
-  // ---------- CGA 640x200 双色（模式 6）：1bpp，双 bank 交错，纵向 2 倍 ----------
-  else if (vga.mode == MODE_CGA_640x200) {
-    uint32_t off = 0x000000;
-    uint32_t on  = 0xFFFFFF;
 
-    if (cga_composite) {
-      // 复合伪色：640 宽模式下 1 个像素 = 1 个 14.318MHz 采样
-      comp_prepare();
-      static uint8_t  idx[640];
-      static uint32_t line[640];
-      for (int y = 0; y < 200; y++) {
-        int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
-        for (int x = 0; x < 640; x++) {
-          uint8_t b = memory[base + (x >> 3)];
-          idx[x] = (b & (0x80 >> (x & 7))) ? 15 : 0;
+        // 光标
+        int page = memory[0x462] & 0x07;
+        int cx = memory[0x450 + page * 2];
+        int cy = memory[0x450 + page * 2 + 1];
+        if (!(memory[0x460] & 0x20) && cx < cols && cy < 25) {
+            gint64 now = g_get_monotonic_time();
+            if (((now / 500000) % 2) == 0) {
+                int px0 = cx * 8, py = cy * 16;
+                for (int y = 14; y <= 15; y++) {
+                    uint32_t* dst = &px[(py + y) * W + px0];
+                    for (int x = 0; x < 8; x++) dst[x] = 0xAAAAAA;
+                }
+            }
         }
-        for (int x = 0; x < 640; x++) line[x] = comp_px(idx, 640, 1, x);
-        int dy = y * 2;
-        memcpy(&vga.pixels[dy * 640], line, 640 * 4);
-        memcpy(&vga.pixels[(dy + 1) * 640], line, 640 * 4);
-      }
-      cairo_surface_mark_dirty(vga.surface);
-      return true;
+    }
+    // ------------------------------------------------------------
+    // VGA 320x200x256
+    // ------------------------------------------------------------
+    else if (vga.mode == MODE_GFX_320x200) {
+        for (int y = 0; y < 200; y++) {
+            const uint8_t* src = &memory[VGA_GFX_ADDR + y * 320];
+            uint32_t* dst = &px[y * W];
+            for (int x = 0; x < 320; x++) {
+                uint8_t pix = src[x];
+                uint8_t r6 = vga_palette_256[pix][0];
+                uint8_t g6 = vga_palette_256[pix][1];
+                uint8_t b6 = vga_palette_256[pix][2];
+                uint8_t r = (r6 << 2) | (r6 >> 4);
+                uint8_t g = (g6 << 2) | (g6 >> 4);
+                uint8_t b = (b6 << 2) | (b6 >> 4);
+                dst[x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+            }
+        }
+    }
+    // ------------------------------------------------------------
+    // VGA 640x480x16（位平面 + 属性控制器 + DAC）
+    // ------------------------------------------------------------
+    else if (vga.mode == MODE_GFX_640x480) {
+        // 预计算 16 个 raw → 最终 RGB
+        static uint32_t pal16[16];
+        static uint8_t  pal16_last[16] = {0xFF,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        bool need = false;
+        for (int i = 0; i < 16; i++) {
+            if (vga_attr_palette[i] != pal16_last[i]) { need = true; break; }
+        }
+        if (need) {
+            for (int i = 0; i < 16; i++) {
+                uint8_t dac = vga_attr_palette[i] & 0x3F;
+                uint8_t r6 = vga_palette_256[dac][0];
+                uint8_t g6 = vga_palette_256[dac][1];
+                uint8_t b6 = vga_palette_256[dac][2];
+                uint8_t r = (r6 << 2) | (r6 >> 4);
+                uint8_t g = (g6 << 2) | (g6 >> 4);
+                uint8_t b = (b6 << 2) | (b6 >> 4);
+                pal16[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+            }
+            memcpy(pal16_last, vga_attr_palette, 16);
+        }
+
+        const uint8_t* p0 = vga_planes[0];
+        const uint8_t* p1 = vga_planes[1];
+        const uint8_t* p2 = vga_planes[2];
+        const uint8_t* p3 = vga_planes[3];
+
+        for (int y = 0; y < 480; y++) {
+            uint32_t* dst = &px[y * W];
+            uint32_t base = (uint32_t)(y * 640) / 8;
+            for (int xb = 0; xb < 80; xb++) {
+                uint32_t off = base + xb;
+                uint8_t b0 = p0[off], b1 = p1[off], b2 = p2[off], b3 = p3[off];
+                for (int bit = 7; bit >= 0; bit--) {
+                    uint8_t raw = ((b0 >> bit) & 1) |
+                                  (((b1 >> bit) & 1) << 1) |
+                                  (((b2 >> bit) & 1) << 2) |
+                                  (((b3 >> bit) & 1) << 3);
+                    *dst++ = pal16[raw];
+                }
+            }
+        }
+    }
+    // ------------------------------------------------------------
+    // CGA 320x200 四色
+    // ------------------------------------------------------------
+    else if (vga.mode == MODE_CGA_320x200) {
+        RGBColor bgc = vga_palette[cga_color_reg & 0x0F];
+        uint32_t bg = (bgc.r << 16) | (bgc.g << 8) | bgc.b;
+        uint32_t pal[4];
+        if (cga_bw) {
+            pal[0] = bg;
+            pal[1] = pal[2] = pal[3] = 0xFFFFFF;
+        } else {
+            cga_get_palette4(pal, bg);
+        }
+
+        if (cga_composite) {
+            comp_prepare();
+            static uint8_t  idx[320];
+            static uint32_t line[320];
+            uint8_t pidx[4];
+            pidx[0] = cga_color_reg & 0x0F;
+            if (cga_bw) {
+                pidx[1] = pidx[2] = pidx[3] = 15;
+            } else {
+                static const uint8_t p0[3] = { 2, 4, 6 };
+                static const uint8_t p1[3] = { 3, 5, 7 };
+                for (int i = 0; i < 3; i++) {
+                    uint8_t v = (cga_color_reg & 0x20) ? p1[i] : p0[i];
+                    if (cga_color_reg & 0x10) v |= 0x08;
+                    pidx[i + 1] = v;
+                }
+            }
+            for (int y = 0; y < 200; y++) {
+                int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
+                const uint8_t* src = &memory[base];
+                for (int x = 0; x < 320; x++) {
+                    uint8_t b = src[x >> 2];
+                    idx[x] = pidx[(b >> ((3 - (x & 3)) * 2)) & 3];
+                }
+                for (int x = 0; x < 320; x++) line[x] = comp_px(idx, 320, 2, x);
+                int dy = y * 2;
+                uint32_t* d0 = &px[dy * W];
+                uint32_t* d1 = &px[(dy + 1) * W];
+                for (int x = 0; x < 320; x++) {
+                    uint32_t c = line[x];
+                    int dx = x * 2;
+                    d0[dx] = d0[dx + 1] = c;
+                    d1[dx] = d1[dx + 1] = c;
+                }
+            }
+        } else {
+            for (int y = 0; y < 200; y++) {
+                int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
+                const uint8_t* src = &memory[base];
+                int dy = y * 2;
+                uint32_t* d0 = &px[dy * W];
+                uint32_t* d1 = &px[(dy + 1) * W];
+                for (int x = 0; x < 320; x++) {
+                    uint8_t b = src[x >> 2];
+                    uint32_t c = pal[(b >> ((3 - (x & 3)) * 2)) & 3];
+                    int dx = x * 2;
+                    d0[dx] = d0[dx + 1] = c;
+                    d1[dx] = d1[dx + 1] = c;
+                }
+            }
+        }
+    }
+    // ------------------------------------------------------------
+    // CGA 640x200 双色
+    // ------------------------------------------------------------
+    else if (vga.mode == MODE_CGA_640x200) {
+        uint32_t off = 0x000000;
+        uint32_t on  = 0xFFFFFF;
+        if (cga_composite) {
+            comp_prepare();
+            static uint8_t  idx[640];
+            static uint32_t line[640];
+            for (int y = 0; y < 200; y++) {
+                int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
+                const uint8_t* src = &memory[base];
+                for (int x = 0; x < 640; x++)
+                    idx[x] = (src[x >> 3] & (0x80 >> (x & 7))) ? 15 : 0;
+                for (int x = 0; x < 640; x++) line[x] = comp_px(idx, 640, 1, x);
+                int dy = y * 2;
+                memcpy(&px[dy * W], line, 640 * 4);
+                memcpy(&px[(dy + 1) * W], line, 640 * 4);
+            }
+            cairo_surface_mark_dirty(vga.surface);
+            return true;
+        }
+        for (int y = 0; y < 200; y++) {
+            int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
+            const uint8_t* src = &memory[base];
+            int dy = y * 2;
+            uint32_t* d0 = &px[dy * W];
+            uint32_t* d1 = &px[(dy + 1) * W];
+            for (int xb = 0; xb < 80; xb++) {
+                uint8_t b = src[xb];
+                for (int bit = 7; bit >= 0; bit--) {
+                    uint32_t c = (b & (1 << bit)) ? on : off;
+                    int dx = xb * 8 + (7 - bit);
+                    d0[dx] = c;
+                    d1[dx] = c;
+                }
+            }
+        }
     }
 
-    for (int y = 0; y < 200; y++) {
-      int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
-      int dy = y * 2;
-      for (int x = 0; x < 640; x++) {
-        uint8_t b = memory[base + (x >> 3)];
-        uint32_t c = (b & (0x80 >> (x & 7))) ? on : off;
-        vga.pixels[dy * 640 + x]       = c;
-        vga.pixels[(dy + 1) * 640 + x] = c;
-      }
+    // VGA 640x480 平面全 0 → 提示
+    if (vga.mode == MODE_GFX_640x480) {
+        bool all_zero = true;
+        for (int p = 0; p < 4 && all_zero; p++) {
+            for (int i = 0; i < 64; i++) {
+                if (vga_planes[p][i] != 0) { all_zero = false; break; }
+            }
+        }
+        if (all_zero) draw_centered_message("Screen is not initizalied");
     }
-  }
 
-  cairo_surface_mark_dirty(vga.surface);
-  return true;
+    cairo_surface_mark_dirty(vga.surface);
+    return true;
 }
 
 // ============================================================

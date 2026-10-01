@@ -22,4 +22,4 @@ jobs:
       run: make
 
     - name: Verify binary exists
-      run: test -f dos86 && echo "build ok"
+      run: test -f build/8086emu && echo "build ok"

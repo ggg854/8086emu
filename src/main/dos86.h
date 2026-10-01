@@ -6,6 +6,7 @@
 #include "vga.h"
 #include "ide.h"
 #include <stdbool.h>
+#include "config.h"
 
 extern volatile bool emu_running;
 extern bool debug_mode;
@@ -13,7 +14,8 @@ extern bool debug_mode;
 //          该模式下强制关闭 -dbg 日志
 extern bool console_mode;
 
-void init_emulator(int argc, char** argv);
+
+void init_emulator(const Config* cfg);
 
 char* open_bios_dialog(void);
 char* open_floppy_dialog(int drive);   // drive：0=A:，1=B:

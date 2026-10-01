@@ -79,5 +79,13 @@ gboolean vga_on_key_release(GtkWidget* widget, GdkEventKey* event, gpointer data
 //   which: 0=硬盘(IDE) 1=软盘(FDC) 2=CD-ROM（以后加） 3=键盘
 void vga_led_activity(int which);
 bool vga_led_dirty(void);
-
+#define VGA_PLANE_SIZE  0x10000
+extern uint8_t vga_planes[4][VGA_PLANE_SIZE];
+extern uint8_t vga_seq_regs[8];
+extern uint8_t vga_gc_regs[16];
+extern uint8_t vga_attr_regs[0x20];
+extern uint8_t vga_attr_palette[16];
+uint8_t vga_mem_read(uint32_t off);
+void    vga_mem_write(uint32_t off, uint8_t val);
+bool    vga_mem_owns(uint32_t addr);   // 判断该地址是否落在 VGA 窗口
 #endif

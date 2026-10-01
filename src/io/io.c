@@ -3,6 +3,7 @@
 #include "cpu.h"
 #include "ide.h"
 #include "vga.h"
+#include "protect.h"
 #include "dma.h"
 #include "fdc.h"
 #include <stdio.h>
@@ -1035,9 +1036,7 @@ uint8_t io_read_port(uint16_t port) {
       break;
     }
 
-    // ---- A20 门（AT 的 Fast A20 Gate，端口 92h）----
-    //   bit1 = A20 状态；bit0 = 快速复位（写 1 触发，读回恒 0）。
-    case 0x92: ret = cpu_a20_enabled ? 0x02 : 0x00; break;
+    
 
     // ---- 串口 COM1（真 8250 寄存器）----
     case 0x3F8: case 0x3F9: case 0x3FA:
@@ -1238,16 +1237,23 @@ void io_write_port(uint16_t port, uint8_t val) {
       fdc_write_port(port, val);
       break;
 
-    // ---- VGA ----
     case 0x3C0:
-      // 翻转触发器：索引 / 数据 交替着来
-      if (attr_data_phase) attr_regs[attr_index & 0x1F] = val;
-      else                 attr_index = val & 0x1F;
-      attr_data_phase = !attr_data_phase;
-      break;
+    if (attr_data_phase) {
+        uint8_t idx = attr_index & 0x1F;
+        attr_regs[idx] = val;
+        vga_attr_regs[idx] = val;
+        if (idx < 0x10) vga_attr_palette[idx] = val & 0x3F;
+    } else {
+        attr_index = val & 0x1F;
+    }
+    attr_data_phase = !attr_data_phase;
+    break;
     case 0x3C2: vga_misc_out = val; break;
     case 0x3C4: seq_index = val & 0x07; break;
-    case 0x3C5: seq_regs[seq_index & 0x07] = val; break;
+    case 0x3C5:
+    seq_regs[seq_index & 0x07] = val;
+    vga_seq_regs[seq_index & 0x07] = val;   // ← 加这行
+    break;
     case 0x3C6: vga_dac_mask = val; break;
     case 0x3C7: vga_dac_read_index = val; dac_read_phase = 0; break;
     case 0x3C8: vga_dac_write_index = val; dac_write_phase = 0; break;
@@ -1257,7 +1263,7 @@ void io_write_port(uint16_t port, uint8_t val) {
       if (dac_write_phase == 0) vga_dac_write_index++;
       break;
     case 0x3CE: gc_index = val & 0x0F; break;
-    case 0x3CF: gc_regs[gc_index & 0x0F] = val; break;
+    case 0x3CF: gc_regs[gc_index & 0x0F] = val; vga_gc_regs[gc_index & 0x0F] = val; break;
     case 0x3D4: crtc_index = val & 0x1F; break;
     case 0x3D5: {
       uint8_t idx = crtc_index & 0x1F;
@@ -1278,8 +1284,11 @@ void io_write_port(uint16_t port, uint8_t val) {
     // ---- 8255 端口 B ----
     case 0x61: ppi_port_b = val; break;
 
-    // ---- A20 门（端口 92h）：bit1 置位打开 A20，清位关闭 ----
-    case 0x92: cpu_set_a20((val & 0x02) != 0); break;
+    case 0x92:
+    fprintf(stderr, "[PORT92] write %02X (bit1=%d) @%04X:%04X\n",
+            val, (val >> 1) & 1, cpu.cs, cpu.ip);
+    cpu_set_a20((val & 0x02) != 0);
+    break;
 
     // ---- 串口 COM1（真 8250 寄存器）----
     case 0x3F8: case 0x3F9: case 0x3FA:
