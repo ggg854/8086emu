@@ -51,7 +51,7 @@ static void ide_set_error(uint8_t code) {
     ide_error = code;
     ide_drq = false;
     ide_status = IDE_ST_READY | IDE_ST_ERR;
-    if (debug_mode) printf("[IDE] 命令 %02X 出错，错误码 %02X\n", ide_command, code);
+    if (debug_mode) printf("[IDE] command %02X error, error code %02X\n", ide_command, code);
 }
 
 static void ide_ok(bool irq) {
@@ -276,9 +276,11 @@ void ide_mount_floppy(int drive, const char* filename) {
         floppy_data[drive] = NULL;
     }
     if (!filename) {
-        floppy_size[drive] = FLOPPY_SIZE;
-        floppy_data[drive] = calloc(floppy_size[drive], 1);
-        printf("IDE: Blank floppy mounted in %c: (不落盘)\n", 'A' + drive);
+        // 无盘：config 里该驱动器为空，或运行期"弹出"。CMOS 据此不报该软驱存在，
+        // 避免 POST 去测并不存在的驱动器而报 601（B:=4 空白盘误报）。
+        floppy_size[drive] = 0;
+        floppy_data[drive] = NULL;
+        printf("IDE: No floppy in %c:\n", 'A' + drive);
         return;
     }
     FILE* ff = fopen(filename, "rb");
@@ -385,7 +387,7 @@ void ide_flush(void) {
                 printf("IDE: ERROR: cannot write %s\n", floppy_name[d]);
             }
         } else {
-            printf("IDE: floppy %c: 是空白内存盘，改动无法保存\n", 'A' + d);
+            printf("IDE: floppy %c: is blank memory disk, changes not saved\n", 'A' + d);
             floppy_dirty[d] = false;
         }
     }
@@ -570,7 +572,7 @@ void ide_int13_prepare(void) {
         write_byte(0x40, 0x75, 1);
         write_byte(0x40, 0x74, 0);
         if (debug_mode)
-            printf("[IDE] INT 41h 原值 %04X:%04X → 强制指向本表 %04X:%04X\n",
+            printf("[IDE] INT 41h old %04X:%04X -> forced to this table %04X:%04X\n",
                    read_word(0, 0x41 * 4 + 2), read_word(0, 0x41 * 4),
                    INT13_STUB_SEG, INT41_TABLE_OFF);
         write_word(0, 0x41 * 4, INT41_TABLE_OFF);
@@ -584,7 +586,7 @@ void ide_int13_prepare(void) {
         p[10] = (uint8_t)(off >> 8);
         p[11] = (uint8_t)(seg & 0xFF);
         p[12] = (uint8_t)(seg >> 8);
-        if (debug_mode) printf("[IDE] INT 13h 桩已装好，原向量 %04X:%04X\n", seg, off);
+        if (debug_mode) printf("[IDE] INT 13h stub installed, original vector %04X:%04X\n", seg, off);
     }
     write_word(0, 0x13 * 4, INT13_STUB_OFF);
     write_word(0, 0x13 * 4 + 2, INT13_STUB_SEG);
@@ -630,13 +632,20 @@ void ide_int13_handle(void) {
     uint8_t ch = (uint8_t)(cpu.cx >> 8);
 
     if (debug_mode)
-        printf("[IDE] INT13 AH=%02X DL=%02X AL=%02X CH=%02X CL=%02X DH=%02X ES:BX=%04X:%04X 来自=%04X:%04X\n",
+        printf("[IDE] INT13 AH=%02X DL=%02X AL=%02X CH=%02X CL=%02X DH=%02X ES:BX=%04X:%04X from=%04X:%04X\n",
                ah, dl, al, ch, cl, dh, cpu.es, cpu.bx,
                read_word(cpu.ss, (uint16_t)(cpu.sp + 2)), read_word(cpu.ss, cpu.sp));
 
     clear_flag(FLAG_CF);
-    if (dl < 0x80 || dl != 0x80 || !ide_disk.present) {   // 只模拟 0x80 这一台硬盘
-        int13_fail(0x01);                                 // 非法功能/参数
+    if (dl < 0x80) {                    // 软盘不该走到这里（桩已按 DL 分流）
+        int13_fail(0x01);
+        return;
+    }
+    if (dl != 0x80 || !ide_disk.present) {
+        // 只模拟 0x80 这一台盘。POST 会用 AH=10h 探测 0x81（第二块盘）是否存在，
+        //   此时必须返回「驱动器未就绪」(AH=80h) 而不是「非法功能」(01h) ——
+        //   后者会让 POST 误判成控制器故障，进而走错误报告/复位路径。
+        int13_fail(0x80);
         return;
     }
 
@@ -648,6 +657,10 @@ void ide_int13_handle(void) {
 
         case 0x01:                       // 取上次操作状态
             cpu.ax = (uint16_t)(cpu.ax & 0x00FF);   // AH=0
+            break;
+
+        case 0x10:                       // 测试驱动器就绪（POST 探测硬盘是否存在）
+            cpu.ax = (uint16_t)(cpu.ax & 0x00FF);   // AH=0：就绪
             break;
 
         case 0x02:                       // 读扇区（CHS）
@@ -664,7 +677,7 @@ void ide_int13_handle(void) {
                                   IDE_SECTOR_SIZE);
             }
             if (debug_mode)
-                printf("[IDE] INT13 读 LBA=%u → %04X:%04X 扇区首4字节=%02X %02X %02X %02X\n",
+                printf("[IDE] INT13 read LBA=%u -> %04X:%04X first 4 bytes=%02X %02X %02X %02X\n",
                        lba, cpu.es, cpu.bx,
                        ide_disk.data[(size_t)lba * IDE_SECTOR_SIZE + 0],
                        ide_disk.data[(size_t)lba * IDE_SECTOR_SIZE + 1],
@@ -710,7 +723,7 @@ void ide_int13_handle(void) {
             // DOS 自身用 INT 41h 找 DPT，不依赖这个返回值，所以不返回是安全的。
             cpu.ax = 0x0000;
             if (debug_mode)
-                printf("[IDE] INT13 AH=08 返回 CX=%04X DX=%04X\n", cpu.cx, cpu.dx);
+                printf("[IDE] INT13 AH=08 return CX=%04X DX=%04X\n", cpu.cx, cpu.dx);
             break;
         }
 

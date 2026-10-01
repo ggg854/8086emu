@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>          // gettimeofday：用于 RTC 的 UIP 周期性翻转
 
 // ============================================================
 // 8042 键盘控制器（PS/2 键盘 + PS/2 鼠标）
@@ -50,10 +51,15 @@ static uint8_t  kbd_out_port  = 0;
 //   bit4 = 主板 RAM 容量（？）
 // AT POST 把 (P1 & 0xF8) 抄进 BDA 0x12，后面多处 gating 都用它：
 //   F000:1217 bit5=1 → 不装 INT8 向量且不解屏蔽 IRQ0（制造模式）
-//   F000:12D8 bit5=0 → 跳过制造诊断块
-//   F000:156F bit5=0 → 按 F1 重跑 POST（制造模式下才走 resume）
-// 本机只有 CGA（彩色）、键盘锁未锁、非制造模式 → 0x40
-static uint8_t  kbd_p1 = 0x40;
+//   F000:12D8 bit5=0 → 跳过制造诊断块（bit5=1 才执行）
+//   F000:156F bit5=0 → jmp 0050 重跑 POST；bit5=1 → 走 F000:1579 resume → INT 19h 引导
+// 关键：POST 正常完成时 bp=0（F000:0C9C 清零后全程不再写 bp），于是
+//   F000:1516 的 `or bp,bp; je 156F` 必然落到 156F。在 156F 处只有制造模式
+//   （bit5=1）才会走 resume 分支到 INT 19h 引导；非制造模式(bit5=0)直接 jmp 0050
+//   重跑 POST，永远进不了引导。所以这里必须置制造模式。制造诊断块(F000:12E2起)
+//   只读 I/O 端口做设备探测、会给 bp 置 bit15，但不影响 156F 的选路。
+// 本机 CGA（彩色、bit6=1）、键盘锁未锁、制造模式(bit5=1) → 0x60
+static uint8_t  kbd_p1 = 0x60;
 
 // 下一个写到 0x60 的字节归属
 static enum { W_NONE = 0, W_CFG, W_OUTPORT, W_AUX } kbd_wait = W_NONE;
@@ -319,7 +325,7 @@ static void serial_mouse_packet(void) {
   uart_rx_push(b1);
   uart_rx_push((uint8_t)(dx & 0x3F));
   uart_rx_push((uint8_t)(dy & 0x3F));
-  if (debug_mode) printf("[MS] 串口包 %02X %02X %02X\n", b1, dx & 0x3F, dy & 0x3F);
+  if (debug_mode) printf("[MS] serial packet %02X %02X %02X\n", b1, dx & 0x3F, dy & 0x3F);
 }
 
 static uint8_t uart_read_reg(uint16_t port) {
@@ -330,7 +336,7 @@ static uint8_t uart_read_reg(uint16_t port) {
     if (uart_has_data()) {
       uart_rx_head = (uart_rx_head + 1) % UART_RX_SIZE;
       uart_irq_pending = false;                       // 读完才允许投下一个字节
-      if (debug_mode) printf("[UART] 读 3F8 = %02X\n", b);
+      if (debug_mode) printf("[UART] read 3F8 = %02X\n", b);
     }
     return b;
   }
@@ -363,7 +369,7 @@ static uint8_t uart_read_reg(uint16_t port) {
 
 static void uart_write_reg(uint16_t port, uint8_t v) {
   int off = port - 0x3F8;
-  if (debug_mode) printf("[UART] 写 %03X = %02X\n", port, v);
+  if (debug_mode) printf("[UART] write %03X = %02X\n", port, v);
   if (off == 0) {
     if (uart_lcr & 0x80) { uart_dll = v; return; }    // DLAB=1：写除数低字节
     if (uart_mcr & 0x10) { uart_rx_push(v); return; } // 回环：THR 直接进 RBR（BIOS/驱动自检看这个）
@@ -664,7 +670,7 @@ void io_keyboard_poll(void) {
     if (++kbd_stuck_polls > 400000) {     // 每 256 条指令一投 → 约 5 秒
       kbd_stuck_polls = 0;
       kbd_irq_pending = false;
-      printf("[KBD] 0x60=%02X 长时间未被读走，重新投递%s\n",
+      printf("[KBD] 0x60=%02X not read for long, re-deliver%s\n",
              kbd_out_buf, kbd_out_aux ? " IRQ12" : " IRQ1");
     } else {
       return;
@@ -707,12 +713,34 @@ void io_keyboard_poll(void) {
 // 软盘控制器中断（IRQ6 → INT 0Eh）轮询投递
 void io_fdc_poll(void) {
   if (!fdc_irq_pending()) return;
+  if (debug_mode) {
+    static int dbg_cnt = 0;
+    if (dbg_cnt++ < 40)
+      fprintf(stderr, "[FDCPOLL] pending: masked=%d IF=%d vec=%d\n",
+              pic_irq_masked(6), get_flag(FLAG_IF), vector_installed(pic_irq_vector(6)));
+  }
   if (pic_irq_masked(6)) return;
   if (!get_flag(FLAG_IF)) return;
   if (!vector_installed(pic_irq_vector(6))) return;
+  if (debug_mode) fprintf(stderr, "[FDCPOLL] DELIVER IRQ6 -> INT%02X at CS=%04X IP=%04X IF=%d\n",
+                           pic_irq_vector(6), cpu.cs, cpu.ip, (int)get_flag(FLAG_IF));
   fdc_irq_ack();
   pic_ack(6);
   cpu_interrupt(pic_irq_vector(6));
+}
+
+// 实时钟中断（IRQ8 = 从片 IRQ0 → INT 70h）轮询投递
+static bool rtc_irq_pending;   // 前向声明：真正定义在文件后部 CMOS 区段（=false 初值）
+void io_rtc_poll(void) {
+  if (!rtc_irq_pending) return;
+  if (pic_irq_masked(8)) { fprintf(stderr, "[RTCPOLL] masked\n"); return; }
+  if (!get_flag(FLAG_IF)) { fprintf(stderr, "[RTCPOLL] IF=0\n"); return; }
+  if (!vector_installed(pic_irq_vector(8))) { fprintf(stderr, "[RTCPOLL] vec not installed\n"); return; }
+  fprintf(stderr, "[RTCPOLL] DELIVER IRQ8 -> INT%02X at CS=%04X IP=%04X\n",
+          pic_irq_vector(8), cpu.cs, cpu.ip);
+  rtc_irq_pending = false;
+  pic_ack(8);
+  cpu_interrupt(pic_irq_vector(8));
 }
 
 // 硬盘中断（IRQ14 = 从片 IRQ6 → INT 76h）轮询投递。
@@ -791,6 +819,7 @@ extern uint8_t vga_dac_write_index;
 static uint8_t cmos_index = 0;
 static uint8_t cmos_rtc[128] = {0};
 static bool    cmos_nmi_disabled = false;   // 端口 70h 写入的 bit7：置位屏蔽 NMI
+static bool    rtc_irq_pending = false;     // RTC 待投递的 IRQ8（POST 使能 RTC 中断后触发一次）
 
 static uint8_t bcd(uint8_t v) {
   return ((v / 10) << 4) | (v % 10);
@@ -813,6 +842,12 @@ static void cmos_update_time(void) {
   cmos_rtc[0x08] = rtc_enc((uint8_t)(tm->tm_mon + 1));
   cmos_rtc[0x09] = rtc_enc((uint8_t)(tm->tm_year % 100));
   cmos_rtc[0x32] = rtc_enc((uint8_t)((tm->tm_year + 1900) / 100));
+}
+
+// 刷新时间寄存器（每次读 CMOS 端口都调用，使 RTC 永远与宿主时钟一致）。
+// UIP 位的翻转放在端口 0x71 读取 0x0A 时处理（见下方 case 0x71）。
+static void cmos_update_rtc(void) {
+  cmos_update_time();
 }
 
 // 配置校验和重算：POST 的校验例程（F000:06FE）把 0x10~0x2D 逐字节累加成 16 位，
@@ -910,7 +945,7 @@ void io_cmos_sync_floppies(void) {
     cmos_rtc[0x14] |= (uint8_t)((n - 1) << 6);
   }
   cmos_update_checksum();
-  fprintf(stderr, "[CMOS] 软驱 A:=%u B:=%u → 0x10=%02X 0x14=%02X (chk=%02X%02X)\n",
+  fprintf(stderr, "[CMOS] floppy A:=%u B:=%u -> 0x10=%02X 0x14=%02X (chk=%02X%02X)\n",
           a, b, cmos_rtc[0x10], cmos_rtc[0x14], cmos_rtc[0x2E], cmos_rtc[0x2F]);
 }
 
@@ -1016,7 +1051,7 @@ uint8_t io_read_port(uint16_t port) {
       kbd_out_buf = 0;
       kbd_out_aux = false;
       kbd_irq_pending = false;         // 中断已消费，可以投递下一个字节
-      if (debug_mode) printf("[KBD] 读 0x60=%02X\n", ret);
+      if (debug_mode) printf("[KBD] read 0x60=%02X\n", ret);
       break;
     }
     case 0x64: {
@@ -1120,8 +1155,12 @@ uint8_t io_read_port(uint16_t port) {
     // ---- CMOS ----
     case 0x70: ret = (uint8_t)(cmos_index | (cmos_nmi_disabled ? 0x80 : 0x00)); break;
     case 0x71: {
-      cmos_update_time();
+      cmos_update_rtc();   // 刷新时间
       uint8_t idx = cmos_index & 0x7F;
+      // 状态寄存器 A 的 UIP（bit7）每次被读就翻转：BIOS 的实时钟自检靠轮询这个位
+      // 确认 RTC 在走，看到一次 0→1→0 即认为时钟正常。用"读即翻转"而非真实时间，
+      // 因为 BIOS 轮询在模拟时间中、真实时间几乎不过，wall-clock 驱动会跨不过边界 → 163。
+      if (idx == 0x0A) cmos_rtc[0x0A] ^= 0x80;
       ret = cmos_rtc[idx];
       // 状态寄存器 C 读后即清（真机语义：中断标志读走即消）
       if (idx == 0x0C) cmos_rtc[0x0C] = 0;
@@ -1265,11 +1304,11 @@ void io_write_port(uint16_t port, uint8_t val) {
           break;
         case W_AUX:                          // 0x64=0xD4 之后：发给鼠标设备
           kbd_wait = W_NONE;
-          if (debug_mode) printf("[KBD] → 鼠标设备 %02X\n", val);
+          if (debug_mode) printf("[KBD] -> mouse device %02X\n", val);
           aux_device_write(val);
           break;
         default:                             // 默认：发给键盘设备
-          if (debug_mode) printf("[KBD] → 键盘设备 %02X\n", val);
+          if (debug_mode) printf("[KBD] -> keyboard device %02X\n", val);
           kbd_device_write(val);
           break;
       }
@@ -1277,7 +1316,7 @@ void io_write_port(uint16_t port, uint8_t val) {
       break;
     }
     case 0x64: {
-      if (debug_mode) printf("[KBD] 写 0x64=%02X\n", val);
+      if (debug_mode) printf("[KBD] write 0x64=%02X\n", val);
       kbd_in_full = true;
       switch (val) {
         case 0x20:  // 读命令字节
@@ -1394,7 +1433,17 @@ void io_write_port(uint16_t port, uint8_t val) {
       cmos_index = val & 0x7F;
       break;
     case 0x71: {
-      cmos_rtc[cmos_index & 0x7F] = val;
+      uint8_t idx = cmos_index & 0x7F;
+      cmos_rtc[idx] = val;
+      // 状态 B（0x0B）写：若使能了某个 RTC 中断（PIE/AE/UIE，位 6/5/4），
+      // 模拟"该中断已发生"——置状态 C（0x0C）对应标志并挂一个 IRQ8 待投。
+      // AT POST 的 163 自检就是等这次 IRQ8 把 [40:6B] 置 1，缺它就会报 163。
+      // 0x0B 的 6/5/4 位与 0x0C 的 PF/AF/UF 同位，故直接按位或。
+      if (idx == 0x0B && (val & 0x70)) {
+        cmos_rtc[0x0C] |= (uint8_t)(val & 0x70);
+        rtc_irq_pending = true;
+        fprintf(stderr, "[RTC] statusB write %02X -> IRQ8 pending (0x0C=%02X)\n", val, cmos_rtc[0x0C]);
+      }
       cmos_save();          // ★ 客机对 CMOS 的改动立刻落盘（POST/SETUP 写回不丢）
       break;
     }

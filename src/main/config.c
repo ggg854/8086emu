@@ -105,7 +105,14 @@ static void on_pick_file(GtkWidget* btn, gpointer data) {
     gtk_widget_destroy(dlg);
 }
 
-// 一行：标签 + 输入框 + "..." 按钮
+// 清空路径回调：点 "Clear" 按钮时调用
+static void on_clear_path(GtkWidget* btn, gpointer data) {
+    (void)btn;
+    GtkWidget* entry = (GtkWidget*)data;
+    gtk_entry_set_text(GTK_ENTRY(entry), "");
+}
+
+// 一行：标签 + 输入框 + "..." 按钮 + "Clear" 按钮
 static GtkWidget* add_file_row(GtkGrid* grid, int row, const char* label,
                                const char* initial,
                                const char* dlg_title,
@@ -127,9 +134,13 @@ static GtkWidget* add_file_row(GtkGrid* grid, int row, const char* label,
     g_signal_connect_data(btn, "clicked", G_CALLBACK(on_pick_file),
                           ctx, (GClosureNotify)g_free, 0);
 
+    GtkWidget* clear_btn = gtk_button_new_with_label("Clear");
+    g_signal_connect(clear_btn, "clicked", G_CALLBACK(on_clear_path), ent);
+
     gtk_grid_attach(grid, lbl, 0, row, 1, 1);
     gtk_grid_attach(grid, ent, 1, row, 1, 1);
     gtk_grid_attach(grid, btn, 2, row, 1, 1);
+    gtk_grid_attach(grid, clear_btn, 3, row, 1, 1);
 
     *out_entry = ent;
     return ent;

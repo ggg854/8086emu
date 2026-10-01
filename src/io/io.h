@@ -27,6 +27,7 @@ void io_pit_step(uint32_t cycles);   // 传"这一步走掉多少 CPU 周期"，
 void io_timer_poll(void);
 void io_keyboard_poll(void);
 void io_fdc_poll(void);
+void io_rtc_poll(void);   // IRQ8（从片 IRQ0 → INT 70h）
 void io_ide_poll(void);   // IRQ14（从片 IRQ6 → INT 76h）
 void io_serial_poll(void); // IRQ4（COM1 收数据 → INT 0Ch），串口鼠标走这里
 

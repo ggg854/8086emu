@@ -486,6 +486,7 @@ static gboolean tick(gpointer data) {
         io_fdc_poll();
         io_ide_poll();
         io_serial_poll();    // ★ 串口鼠标：停机期间也要组包/投 IRQ4，否则鼠标永远不动
+        io_rtc_poll();       // ★ RTC：停机期间也要把 pending 的 IRQ8 投出去
         io_timer_poll();
         if (cpu_halted) {
             // ★ 停机期间 CPU 不执行指令，但硬件时钟照走：把这段虚拟时间补给周期计数器，
@@ -532,7 +533,7 @@ static gboolean tick(gpointer data) {
 
         // ★ 检测 1：跑到 IVT 区（只警告 + 停 CPU，不退出）
         if (cpu.cs == 0x0000 && cpu.ip < 0x0400) {
-            fprintf(stderr, "\n[CPU] Fly：CS=%04X IP=%04X 落在 IVT 区\n",
+            fprintf(stderr, "\n[CPU] Fly: CS=%04X IP=%04X landed in IVT region\n",
                     cpu.cs, cpu.ip);
             fprintf(stderr, "  AX=%04X BX=%04X CX=%04X DX=%04X\n",
                     cpu.ax, cpu.bx, cpu.cx, cpu.dx);
@@ -616,6 +617,7 @@ static gboolean tick(gpointer data) {
             //   只要 IF=1 就立刻进 IRQ1，手动输入不再"有时候没反应"。
             io_keyboard_poll();
             io_timer_poll();     // ★ 锁存的 IRQ0（BIOS tick）：CLI 期间不丢，IF=1 立刻投
+            io_rtc_poll();       // ★ RTC：每 256 条指令轮询一次，避免错过 POST 的等待窗口
         }
 
         insn_this_frame++;
@@ -846,6 +848,7 @@ void ui_reset_machine(void) {
     cpu_reset();
     vga_reset();
     vga_video_rom_install();     // 清 RAM 会把 C000 段的显卡选件 ROM 冲掉，必须重装
+    cpu_install_exception_stubs();
     
 }
 
@@ -859,6 +862,7 @@ void init_emulator(const Config* cfg) {
     else printf("[BIOS] no BIOS specified\n");
 
     vga_video_rom_install();
+    cpu_install_exception_stubs();
     ide_init();
     if (cfg->disk[0]) ide_mount_disk(cfg->disk);
     ide_mount_floppy(0, cfg->floppy_a[0] ? cfg->floppy_a : NULL);

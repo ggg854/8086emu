@@ -469,7 +469,7 @@ void protect_interrupt(uint8_t vector, bool has_error, uint16_t error_code, bool
 
     // IDT 越界 → 停机
     if ((uint32_t)vector * 8 + 7 > (uint32_t)protect.idt_limit) {
-        fprintf(stderr, "[FAULT] IDT 越界 (vec %d) -> shutdown\n", vector);
+        fprintf(stderr, "[FAULT] IDT out of bounds (vec %d) -> shutdown\n", vector);
         cpu_running = false;
         return;
     }

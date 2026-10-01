@@ -687,6 +687,17 @@ static uint32_t insn_cyc(uint8_t op, uint8_t modrm) {
 void cpu_execute_instruction(void) {
     uint32_t addr = cpu_seg_base(cpu.cs) + cpu.ip;
     uint8_t opcode = cpu_mem_read(addr);
+    if (cpu.cs == 0xC200 && cpu.ip == 0x0003)
+        fprintf(stderr, "[ROM] VGA option ROM entry C200:0003 executed\n");
+
+    if (debug_mode && cpu.cs == 0xF000) {
+        if (cpu.ip == 0x2BB7) fprintf(stderr, "[TRACE] enter diskette test 2bb7 (di=%d)\n", cpu.di);
+        else if (cpu.ip == 0x2BBA) fprintf(stderr, "[TRACE] recal#1 call 2bba\n");
+        else if (cpu.ip == 0x2AA9) fprintf(stderr, "[TRACE] enter seek sub 2aa9 (cl=%d di=%d ch=%d)\n", cpu.cx & 0xFF, cpu.di, (cpu.cx >> 8) & 0xFF);
+        else if (cpu.ip == 0x2ABD) fprintf(stderr, "[TRACE] recal#2 call 2abd\n");
+        else if (cpu.ip == 0x2AEC) fprintf(stderr, "[TRACE] SEEK output 2aec (ah will be 0x%02X)\n", (cpu.ax >> 8) & 0xFF);
+        else if (cpu.ip == 0x2B1F) fprintf(stderr, "[TRACE] wait 2b1f (di=%d)\n", cpu.di);
+    }
 
     at_post_restart_hook(addr);   // ★ POST 软重启入口：把 A20 复位成上电默认值
 
@@ -2548,20 +2559,18 @@ static const char* exc_name(uint8_t v) {
 // 打印故障现场：类型/原因、CS:IP、通用与段寄存器、出错指令附近字节、栈顶
 void cpu_fault_dump(const char* kind, uint8_t vector, const char* why) {
 	fprintf(stderr, "\n[FAULT] ========== %s ==========\n", kind);
-	fprintf(stderr, "[FAULT] 类型：%s (向量 %02Xh)", exc_name(vector), vector);
-	if (why && why[0]) fprintf(stderr, "  原因：%s", why);
+	fprintf(stderr, "[FAULT] type: %s (vector %02Xh)", exc_name(vector), vector);
+	if (why && why[0]) fprintf(stderr, "  cause: %s", why);
 	fprintf(stderr, "\n");
 	fprintf(stderr, "[FAULT] CS:IP=%04X:%04X  SS:SP=%04X:%04X  DS=%04X ES=%04X\n",
 	        cpu.cs, cpu.ip, cpu.ss, cpu.sp, cpu.ds, cpu.es);
 	fprintf(stderr, "[FAULT] AX=%04X BX=%04X CX=%04X DX=%04X SI=%04X DI=%04X BP=%04X FL=%04X\n",
 	        cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.si, cpu.di, cpu.bp, cpu.flags);
-	// 出错指令附近字节：F6/F7 等已把 IP 推进到下一条，故从 IP-6 起打 8 字节，
-	// 并把 IP 所指字节用方括号标出
-	// ★ 诊断读必须绕开保护模式限长检查（seg_lin）：栈 dump 会读到偏移 0xFFFF，
-	//   若走限长检查会再触发一次 #GP，形成"报告故障时又出故障"的递归。
+	// 出错指令附近字节（F6/F7 等已把 IP 推进到下一条，故从 IP-6 起打 8 字节，
+	// IP 所指字节用方括号标出）
 	{
 		uint16_t start = (uint16_t)(cpu.ip - 6);
-		fprintf(stderr, "[FAULT] 代码 @%04X:%04X:", cpu.cs, start);
+		fprintf(stderr, "[FAULT] code @%04X:%04X:", cpu.cs, start);
 		for (int i = 0; i < 8; i++) {
 			uint8_t b = cpu_mem_read(cpu_seg_base(cpu.cs) + (uint16_t)(start + i));
 			if (i == 6) fprintf(stderr, " [%02X]", b);
@@ -2570,7 +2579,7 @@ void cpu_fault_dump(const char* kind, uint8_t vector, const char* why) {
 		fprintf(stderr, "\n");
 	}
 	// 栈顶 8 个字
-	fprintf(stderr, "[FAULT] 栈 @%04X:%04X:", cpu.ss, cpu.sp);
+	fprintf(stderr, "[FAULT] stack @%04X:%04X:", cpu.ss, cpu.sp);
 	for (int i = 0; i < 8; i++) {
 		uint32_t a = cpu_seg_base(cpu.ss) + (uint16_t)(cpu.sp + i * 2);
 		fprintf(stderr, " %04X", cpu_mem_read(a) | (cpu_mem_read(a + 1) << 8));
@@ -2589,12 +2598,12 @@ void cpu_exception(uint8_t vector, const char* why) {
 		return;
 	}
 	if (in_fault) {
-		cpu_fault_dump("双重故障 (double fault)", 8, why);
+		cpu_fault_dump("double fault", 8, why);
 		uint16_t o = read_word(0, 8 * 4), s = read_word(0, 8 * 4 + 2);
 		if ((o | s) == 0) {
-			fprintf(stderr, "[FAULT] 双重故障向量 08h 也为空 → 三重故障 (triple fault) → 停机\n");
+			fprintf(stderr, "[FAULT] double-fault vector 08h also empty -> triple fault -> halt\n");
 		} else {
-			fprintf(stderr, "[FAULT] 异常处理中再次出错 → 双重故障 → 停机\n");
+			fprintf(stderr, "[FAULT] error during exception handling -> double fault -> halt\n");
 		}
 		fflush(stderr);
 		in_fault = 0;
@@ -2602,15 +2611,24 @@ void cpu_exception(uint8_t vector, const char* why) {
 		return;
 	}
 
-	if (debug_mode) cpu_fault_dump("CPU 异常", vector, why);
+	if (debug_mode) cpu_fault_dump("CPU exception", vector, why);
 
 	uint32_t va = (uint32_t)vector * 4;
 	uint16_t o = read_word(0, va), s = read_word(0, va + 2);
 	if ((o | s) == 0) {
-		fprintf(stderr, "[FAULT] 向量 %02Xh 为空，异常无法投递 → 双重故障 → 停机\n", vector);
-		fflush(stderr);
-		cpu_running = false;
-		return;
+		// 制造模式 POST 清空了 IVT 且未安装 INT 0-7；首次遇到空向量时补装恢复桩
+		// （单字节 IRET，桩字节在 UMA 0xD0000），让 DOS 引导期依赖的异常处理能恢复执行。
+		if (vector <= 7) {
+			cpu_install_exception_stubs();
+			o = read_word(0, va);
+			s = read_word(0, va + 2);
+		}
+		if ((o | s) == 0) {
+			fprintf(stderr, "[FAULT] vector %02Xh empty, exception undeliverable -> double fault -> halt\n", vector);
+			fflush(stderr);
+			cpu_running = false;
+			return;
+		}
 	}
 
 	in_fault = 1;
@@ -2621,9 +2639,9 @@ void cpu_exception(uint8_t vector, const char* why) {
 // 无效操作码：8086 无法继续解码 → 报告现场并停机
 void cpu_invalid_opcode(uint8_t op) {
 	char why[48];
-	snprintf(why, sizeof(why), "操作码 %02Xh", op);
-	cpu_fault_dump("无效操作码 (invalid opcode)", 6, why);
-	fprintf(stderr, "[FAULT] 无效指令无法继续执行 → 停机\n");
+	snprintf(why, sizeof(why), "opcode %02Xh", op);
+	cpu_fault_dump("invalid opcode", 6, why);
+	fprintf(stderr, "[FAULT] invalid instruction cannot continue -> halt\n");
 	fflush(stderr);
 	in_fault = 0;
 	cpu_running = false;
@@ -2631,6 +2649,8 @@ void cpu_invalid_opcode(uint8_t op) {
 
 void cpu_interrupt(uint8_t int_num) {
 	cpu_halted = false;
+	if (int_num == 0x19)
+		fprintf(stderr, "[INT19] int 19h triggered CS:IP=%04X:%04X\n", cpu.cs, cpu.ip);
 	// ★ 时序：硬件/软中断本身约 51 周期（压栈 + 查向量表 + 跳转），
 	//   不记的话中断密集时虚拟时间会偏慢
 	cpu_last_cycles = 51;
@@ -2651,25 +2671,53 @@ void cpu_interrupt(uint8_t int_num) {
 	uint16_t new_cs = read_word(0, vector_addr + 2);
 
 	if (new_cs == 0 && new_ip == 0) {
-		if (in_fault) {
-			fprintf(stderr,
-			        "[FAULT] 异常投递失败：向量 %02Xh 为空（%s）→ 三重故障 (triple fault) → 停机\n",
-			        int_num, exc_name(int_num));
-		} else {
-			fprintf(stderr,
-			        "[FAULT] 向量 %02Xh 为空（%s）@ CS:%04X IP:%04X → 无法投递 → 停机\n",
-			        int_num, exc_name(int_num), cpu.cs, (uint16_t)(cpu.ip - 1));
+		// 制造模式：空向量 0-7 首次出现时补装恢复桩（桩字节在 UMA 0xD0000），
+		// 再读一次向量表，补装后落到下方正常投递逻辑（IRET 恢复执行）。
+		if (int_num <= 7) {
+			cpu_install_exception_stubs();
+			new_ip = read_word(0, vector_addr);
+			new_cs = read_word(0, vector_addr + 2);
 		}
-		cpu.ip = pop();
-		cpu.cs = pop();
-		cpu.flags = pop();
-		in_fault = 0;
-		cpu_running = false;
-		return;
+		if (new_cs == 0 && new_ip == 0) {
+			if (in_fault) {
+				fprintf(stderr,
+				        "[FAULT] 异常投递失败：向量 %02Xh 为空（%s）→ 三重故障 (triple fault) → 停机\n",
+				        int_num, exc_name(int_num));
+			} else {
+				fprintf(stderr,
+				        "[FAULT] 向量 %02Xh 为空（%s）@ CS:%04X IP:%04X → 无法投递 → 停机\n",
+				        int_num, exc_name(int_num), cpu.cs, (uint16_t)(cpu.ip - 1));
+			}
+			cpu.ip = pop();
+			cpu.cs = pop();
+			cpu.flags = pop();
+			in_fault = 0;
+			cpu_running = false;
+			return;
+		}
 	}
 
 	cpu.ip = new_ip;
 	cpu.cs = new_cs;
 	clear_flag(FLAG_IF);
 	clear_flag(FLAG_TF);
+}
+
+// 制造模式 POST 会跳过 INT 0-7 的安装；DOS 引导期依赖这些异常向量
+// （AAM 0 做 CPU 探测、BOUND 做边界检查等）。这里在空闲 RAM 内置一个 IRET 桩，
+// 仅给"POST 未安装"的空向量补装，等价于真实 BIOS 的"恢复执行"语义
+// （故障指令已在投递前由 CPU 推进 IP，故 IRET 直接回到下一条）。
+void cpu_install_exception_stubs(void) {
+	// 桩放在 UMA 中确定空闲的 0xD0000（不属 BIOS/DOS 常规内存，也不在选项 ROM 扫描范围
+	// C0000-C8000 内，POST/早期引导不会改写它）。8 个向量共用这一字节 IRET 桩。
+	const uint32_t stub_lin = 0xD0000;
+	memory[stub_lin] = 0xCF;              // 0xCF = iret
+	for (int v = 0; v <= 7; v++) {
+		uint16_t o = read_word(0, (uint32_t)v * 4);
+		uint16_t s = read_word(0, (uint32_t)v * 4 + 2);
+		if ((o | s) == 0) {               // 仅补装未安装的（正常模式 POST 已装则不动）
+			write_word(0, (uint32_t)v * 4,     (uint16_t)(stub_lin & 0xF));
+			write_word(0, (uint32_t)v * 4 + 2, (uint16_t)(stub_lin >> 4));
+		}
+	}
 }

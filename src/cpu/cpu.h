@@ -141,5 +141,6 @@ void write_modrm16(uint8_t modrm, uint16_t val);
 uint8_t get_reg8_val(uint8_t reg);
 void set_reg8_val(uint8_t reg, uint8_t val);
 void load_bios(const char* filename);
+void cpu_install_exception_stubs(void);
 
 #endif

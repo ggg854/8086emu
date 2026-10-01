@@ -439,7 +439,7 @@ void cpu386_execute_0f(void) {
 		}
 
 		default:
-			printf("[CPU] 未实现的 0F %02X @ CS:%04X IP:%04X\n", op2, cpu.cs, cpu.ip);
+			printf("[CPU] unimplemented 0F %02X @ CS:%04X IP:%04X\n", op2, cpu.cs, cpu.ip);
 			cpu_invalid_opcode(op2);
 			break;
 	}
@@ -551,7 +551,7 @@ void cpu386_execute_opcode(uint8_t opcode) {
 		}
 
 		default:
-			printf("[CPU] 未实现的操作码 0x%02X @ CS:%04X IP:%04X\n", opcode, cpu.cs, cpu.ip);
+			printf("[CPU] unimplemented opcode 0x%02X @ CS:%04X IP:%04X\n", opcode, cpu.cs, cpu.ip);
 			cpu_invalid_opcode(opcode);
 			break;
 	}
