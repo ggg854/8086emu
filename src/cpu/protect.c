@@ -5,7 +5,6 @@
 #include <string.h>
 
 ProtectState286 protect;
-int pm_log_budget = 600;
 
 int protect_cpl(void) { return cpu.cs & 0x0003; }
 
@@ -73,18 +72,6 @@ static bool read_desc_sel(uint16_t sel, SegmentDescriptor* d, uint32_t* base,
 
     // P 位检查
     if (!(d->access & SEG_ACCESS_PRESENT)) {
-        // 调试：打印一次
-        static int np_once = 0;
-        if (!np_once) {
-            np_once = 1;
-            fprintf(stderr, "[NP-DBG] sel=%04X addr=%06X pe=%d\n", sel, addr, protect.pe);
-            fprintf(stderr, "[NP-DBG] cs=%04X ip=%04X cs_base=%06X\n",
-                    cpu.cs, cpu.ip, cpu.seg_base[SEG_CS]);
-            fprintf(stderr, "[NP-DBG] desc: %02X %02X %02X %02X %02X %02X %02X %02X\n",
-                    cpu_mem_read(addr), cpu_mem_read(addr+1), cpu_mem_read(addr+2),
-                    cpu_mem_read(addr+3), cpu_mem_read(addr+4), cpu_mem_read(addr+5),
-                    cpu_mem_read(addr+6), cpu_mem_read(addr+7));
-        }
         deliver_exception(EXC_NP, sel & 0xFFFC);
         return false;
     }

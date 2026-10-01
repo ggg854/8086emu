@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <gtk/gtk.h>
 #include "config.h"
+#include "protect.h"
 volatile bool emu_running = true;
 bool debug_mode = false;
 bool console_mode = false;   // -console：无窗口终端模式（见 dos86.h）
@@ -311,7 +312,8 @@ static bool con_map(uint8_t c, uint8_t* sc, bool* shift) {
         return true;
     }
     switch (c) {
-        case 0x0C: *sc = 0x3B; return true;   // TEMP: Ctrl-L(0x0C) → F1，用于自动复现 162 后按 F1
+        // 终端发不出 F1 的扫描码，用 Ctrl-L 顶替（AT POST 报错后要靠 F1 继续）
+        case 0x0C: *sc = 0x3B; return true;   // Ctrl-L → F1 (0x3B)
         case ' ':  *sc = 0x39; return true;
         case '-':  *sc = 0x0C; return true;
         case '=':  *sc = 0x0D; return true;
@@ -538,7 +540,8 @@ static gboolean tick(gpointer data) {
                     cpu.si, cpu.di, cpu.bp, cpu.sp);
             fprintf(stderr, "  DS=%04X ES=%04X SS=%04X CS=%04X\n",
                     cpu.ds, cpu.es, cpu.ss, cpu.cs);
-            fprintf(stderr, "  FL=%04X\n", cpu.flags);
+            fprintf(stderr, "  FL=%04X  a20=%d pe=%d\n",
+                    cpu.flags, (int)cpu_a20_enabled, (int)protect.pe);
             cpu_running = false;
             break;   // ★ 跳出 while，不 return
         }
@@ -635,7 +638,7 @@ static gboolean tick(gpointer data) {
         const char* st = cpu_halted ? "[HALT (waiting for interrupt)]"
                        : (cpu_running ? "[Running]" : "[Stopped]");
         snprintf(title, sizeof(title),
-                 "IBM PC Emulator - %u.%u MHz  %s  HALT=%d",
+                 "IBM PC Emulator - %u.%u MHz  %s  HALT=%d n=%llu",
                  mhz10 / 10, mhz10 % 10, st, cpu_halted ? 1 : 0,
                  (unsigned long long)hlt_count);
         if (!console_mode) gtk_window_set_title(GTK_WINDOW(vga.window), title);
@@ -766,13 +769,16 @@ static void print_usage(const char* exe) {
 "\n"
 "Options:\n"
 "  -help                show this help\n"
-"  -bios <file>         BIOS ROM (default: data/PCXTBIOS.BIN)\n"
+"  -bios <file>         BIOS ROM (default: value from config / data/PCXTBIOS.BIN)\n"
 "  -floppy <file>       floppy A: image (.img/.ima/.360)\n"
 "  -floppy2 <file>      floppy B: image\n"
-"  -disk <file>         hard disk image (default: dos.img)\n"
+"  -disk <file>         hard disk image\n"
 "  -composite           CGA composite artifact colors (NTSC)\n"
 "  -console             headless terminal mode\n"
 "  -dbg                 enable debug log\n"
+"  -config <file>       config file (default: config.json)\n"
+"\n"
+"Giving any of the options above skips the startup config dialog.\n"
 "\n"
 "At runtime: use the 'Machine' menu to swap floppies A:/B: or reset;\n"
 "            use the 'Frequency' menu to change the emulated CPU clock.\n", exe);
@@ -857,6 +863,7 @@ void init_emulator(const Config* cfg) {
     if (cfg->disk[0]) ide_mount_disk(cfg->disk);
     ide_mount_floppy(0, cfg->floppy_a[0] ? cfg->floppy_a : NULL);
     ide_mount_floppy(1, cfg->floppy_b[0] ? cfg->floppy_b : NULL);
+    io_cmos_sync_floppies();   // ★ 镜像挂完才知容量，此时才能把 CMOS 软驱类型对齐
 
     vga_clear(0x07);
     vga_set_composite(cfg->composite);
@@ -908,6 +915,24 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // 命令行机器选项：先解析成局部变量，稍后覆盖配置。给了其中任何一项就跳过
+    // 配置窗口、直接启动（脚本/无头用）。必须在 gtk_init 之前解析：gtk_init 会改写 argv。
+    bool cli_mode = false;
+    const char* cli_bios = NULL, *cli_disk = NULL;
+    const char* cli_fa = NULL, *cli_fb = NULL;
+    bool cli_composite = false, cli_console = false, cli_dbg = false;
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+        bool has_next = (i + 1 < argc);
+        if (strcmp(a, "-bios") == 0 && has_next)         { cli_bios = argv[++i]; cli_mode = true; }
+        else if (strcmp(a, "-disk") == 0 && has_next)    { cli_disk = argv[++i]; cli_mode = true; }
+        else if (strcmp(a, "-floppy") == 0 && has_next)  { cli_fa   = argv[++i]; cli_mode = true; }
+        else if (strcmp(a, "-floppy2") == 0 && has_next) { cli_fb   = argv[++i]; cli_mode = true; }
+        else if (strcmp(a, "-composite") == 0)           { cli_composite = true; cli_mode = true; }
+        else if (strcmp(a, "-console") == 0)             { cli_console = true; cli_mode = true; }
+        else if (strcmp(a, "-dbg") == 0)                 { cli_dbg = true; cli_mode = true; }
+    }
+
     Config cfg;
     memset(&cfg, 0, sizeof(cfg));
 
@@ -916,18 +941,34 @@ int main(int argc, char* argv[]) {
 
     // 尝试加载配置
     bool loaded = config_load(config_path, &cfg);
+    (void)loaded;
 
-    // 弹配置窗口（不管有没有配置文件，都弹）
-    if (!config_dialog(&cfg)) {
-        printf("Cancelled.\n");
-        return 0;
+    // 命令行覆盖配置
+    if (cli_bios) { strncpy(cfg.bios, cli_bios, sizeof(cfg.bios) - 1); cfg.bios[sizeof(cfg.bios) - 1] = 0; }
+    if (cli_disk) { strncpy(cfg.disk, cli_disk, sizeof(cfg.disk) - 1); cfg.disk[sizeof(cfg.disk) - 1] = 0; }
+    if (cli_fa)   { strncpy(cfg.floppy_a, cli_fa, sizeof(cfg.floppy_a) - 1); cfg.floppy_a[sizeof(cfg.floppy_a) - 1] = 0; }
+    if (cli_fb)   { strncpy(cfg.floppy_b, cli_fb, sizeof(cfg.floppy_b) - 1); cfg.floppy_b[sizeof(cfg.floppy_b) - 1] = 0; }
+    if (cli_composite) cfg.composite = true;
+    if (cli_console)   cfg.console = true;
+    if (cli_dbg)       cfg.debug = true;
+
+    // 没指定 BIOS 时按缺省路径找（帮助里承诺的缺省）
+    if (!cfg.bios[0]) {
+        const char* d = find_default_bios();
+        if (d) strncpy(cfg.bios, d, sizeof(cfg.bios) - 1);
     }
 
-    // 保存
-    if (config_save(config_path, &cfg))
-        printf("[CONFIG] saved to %s\n", config_path);
-    else
-        fprintf(stderr, "[CONFIG] failed to save %s\n", config_path);
+    // 既然给了命令行机器选项：直接启动，不弹配置窗口、不回写配置
+    if (!cli_mode) {
+        if (!config_dialog(&cfg)) {
+            printf("Cancelled.\n");
+            return 0;
+        }
+        if (config_save(config_path, &cfg))
+            printf("[CONFIG] saved to %s\n", config_path);
+        else
+            fprintf(stderr, "[CONFIG] failed to save %s\n", config_path);
+    }
 
     printf("IBM PC Emulator\n\n");
 

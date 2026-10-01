@@ -1,0 +1,17 @@
+# 编译产物
+*.o
+*.exe
+build/
+
+# 磁盘镜像与运行时状态（不入库）
+*.img
+*.ima
+*.IMA
+dos.img
+cmos.rom
+
+# BIOS ROM：第三方固件，需自备（见 README 的 Build 一节）
+*.BIN
+*.bin
+*.ROM
+*.rom

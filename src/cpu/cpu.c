@@ -37,28 +37,11 @@ static int in_fault = 0;
 //   注意地址必须先过 A20 门再看范围，且 1MB 以上（HMA）不是 ROM。
 bool cpu_rom_write_protect = false;
 
-// TEMP：写监视（GDT/IDT 关键字节 + GDT[9] base_mid 补丁序列 + GDT/IDT 被清零）
-static int zero_budget = 400;
+// 写监视钩子：由 cpu.h 的 cpu_mem_write（热路径）调用。
+//   调试期曾在里面监视 GDT/IDT/BDA 的写入，现已清空 —— 保留空函数是为了不让
+//   每次内存写都多一次函数调用判断。
 void cpu_mem_watch(uint32_t addr, uint8_t val) {
-	// 一击定位：GDT 描述符区(0xD8A0..0xD930) 被写成 0；按 CS:IP 去重，只报新站点
-	if (zero_budget > 0 && val == 0 && memory[addr] != 0 &&
-	    addr >= 0xD8A0 && addr < 0xD930) {
-		static uint16_t zcs[12], zip[12]; static int zc[12], zn = 0;
-		int found = -1;
-		for (int i = 0; i < zn; i++) if (zcs[i] == cpu.cs && zip[i] == cpu.ip) { found = i; break; }
-		if (found >= 0) { zc[found]++; }
-		else if (zn < 12) {
-			zcs[zn] = cpu.cs; zip[zn] = cpu.ip; zc[zn] = 1; zn++;
-			zero_budget--;
-			fprintf(stderr, "[ZEROIP#%d] %06X old=%02X @%04X:%04X es=%04X(%06X) di=%04X cx=%04X\n",
-			        zn, addr, memory[addr], cpu.cs, cpu.ip, cpu.es, cpu.seg_base[SEG_ES], cpu.di, cpu.cx);
-			fflush(stderr);
-		}
-	}
-	if (addr == 0xD8E5) PMLOG("[W] GDT8.access=%02X @%04X:%04X\n", val, cpu.cs, cpu.ip);
-	if (addr == 0xD8ED) PMLOG("[W] GDT9.access=%02X @%04X:%04X\n", val, cpu.cs, cpu.ip);
-	if (addr == 0xD0FD) PMLOG("[W] IDT11.type=%02X @%04X:%04X\n", val, cpu.cs, cpu.ip);
-	if (addr == 0xD8EC) PMLOG("[W] GDT9.base_mid=%02X @%04X:%04X\n", val, cpu.cs, cpu.ip);
+	(void)addr; (void)val;
 }
 
 // ============================================================
@@ -68,20 +51,43 @@ void cpu_mem_watch(uint32_t addr, uint8_t val) {
 //   XT（8088）没有 A20 门，cpu_is_286=false，地址永远 20 位折回。
 //   物理内存读写（cpu_mem_read/cpu_mem_write）是热路径，已内联在 cpu.h。
 // ============================================================
+// true：ESC(D8~DF) 真正交给 fpu.c 执行，客机能探测到 80287。
+//   AT BIOS 的 POST 在 F000:1497 用 fninit/fnstcw 探测协处理器，探测结果与
+//   CMOS 设备字节 0x14 的 bit1（io.c 的 cmos_init 里已置 1）要一致，否则报 162。
+bool fpu_present_test = true;
 bool cpu_a20_enabled = false;
 bool cpu_is_286 = false;
 bool cpu_reset_pending = false;
 
-static int a20_budget = 40;   // TEMP
 void cpu_set_a20(bool on) {
-    if (on != cpu_a20_enabled) {
-        fprintf(stderr, "[A20] %d->%d @%04X:%04X pe=%d\n",
-                (int)cpu_a20_enabled, (int)on, cpu.cs, cpu.ip, protect.pe);
-    }
     cpu_a20_enabled = on;
 }
 void cpu_request_reset(void) {
     cpu_reset_pending = true;
+}
+
+// ============================================================
+// POST 软重启入口（AT BIOS 的 F000:0050）
+//   AT 的「错误后按 F1」(F000:1576) 和 Ctrl-Alt-Del (F000:3740) 都是一条
+//   `jmp near` 落到 F000:0050 重跑 POST —— 纯软件跳转，不走 8042 的 0xFE
+//   系统复位，cpu_reset() 因此不执行、A20 也回不到上电默认值。
+//   而上一遍 POST 已经在 checkpoint 3A（F000:11AA，AH=0xDD → 8042 输出口
+//   P2.1=0）把 A20 关掉了。第二遍 POST 进保护模式做扩展内存测试时
+//   （F000:08F8，ES=0x48 base=0x100000 的 rep stos）地址折回 0x00000-0x0FFFF，
+//   把 BDA / GDT(0xD8A0) / IDT(0xD0A0) 清成 0，紧接着 F000:08FD 的 pop %ds
+//   （选择子 0x48）读到已毁的描述符 → #NP(11) → 门也不存在 → #DF → triple fault。
+//   真机上这条重启路径等价于重新上电（A20 门回到使能），故在此把 A20 复位成 1，
+//   与 cpu_reset()（8042 0xFE 复位路径）的行为保持一致。
+//   ★ 只改 A20 门的开合；cpu_mem_read/write 的 20 位折回是真机正确行为，不动。
+//   ★ 仅对 AT（cpu_is_286）的实模式生效：XT 没有 A20 门，且其 8KB BIOS 装在
+//     0xFE000 起，0xF0050 不是重启入口。
+// ============================================================
+#define AT_POST_RESTART_LIN 0xF0050u
+static void at_post_restart_hook(uint32_t lin) {
+    if (!cpu_is_286 || protect.pe) return;   // 只有 AT 的实模式 POST 有这个入口
+    if (lin != AT_POST_RESTART_LIN) return;
+    if (cpu_a20_enabled) return;             // 已是上电默认，无需动作
+    cpu_a20_enabled = true;
 }
 
 // ============================================================
@@ -166,15 +172,11 @@ uint16_t cpu_get_seg_ds(void) {
 }
 
 void cpu_init(void) {
-    fprintf(stderr, "&cpu = %p, size=%zu\n", (void*)&cpu, sizeof(cpu));
-    fprintf(stderr, "&cpu.seg_access[6] = %p (cpu end = %p)\n",
-            (void*)&cpu.seg_access[6], (void*)((char*)&cpu + sizeof(cpu)));
-    fprintf(stderr, "&protect = %p, size=%zu\n", (void*)&protect, sizeof(protect));
-    fprintf(stderr, "&protect.pe = %p\n", (void*)&protect.pe);
-    memory = calloc(memory_size, 1);   // 8MB（0x800000）
+    memory = calloc(memory_size, 1);   // 2MB（见 cpu.h 的 CPU_RAM_INSTALLED）
     memset(&memory[0xF0000], 0xFF, 0x10000);
     cpu386_init();
     protect_init();
+    fpu_init();           // ★ 必须初始化：cw/tw/top 的缺省值不靠静态零值
     cpu_reset();
 }
 
@@ -195,6 +197,7 @@ void cpu_reset(void) {
     for (int i = 0; i < 6; i++) { cpu.seg_base[i] = 0; cpu.seg_limit[i] = 0xFFFF; cpu.seg_access[i] = 0x93; }
     protect_reset();
     cpu386_reset();
+    fpu_reset();          // ★ 复位：回到 CW=037F、栈全空（与真机 RESET 后的 x87 一致）
     cpu_a20_enabled = cpu_is_286;   // AT 上电 A20 已开；XT 无 A20 门（20 位折回）
 }
 
@@ -684,6 +687,8 @@ static uint32_t insn_cyc(uint8_t op, uint8_t modrm) {
 void cpu_execute_instruction(void) {
     uint32_t addr = cpu_seg_base(cpu.cs) + cpu.ip;
     uint8_t opcode = cpu_mem_read(addr);
+
+    at_post_restart_hook(addr);   // ★ POST 软重启入口：把 A20 复位成上电默认值
 
     // ★ 时序：先按操作码（及其 ModR/M）记下本步的周期数。
     //   前缀字节单独成一步，各记 2 周期；REP 的每一轮由递归调用自然累加。
@@ -1176,7 +1181,7 @@ void cpu_execute_instruction(void) {
 			if (mod != 3) {
 				ea = decode_modrm_addr(modrm, NULL);
 			}
-			fpu_escape(opcode, modrm, ea);
+			{ extern bool fpu_present_test; if (fpu_present_test) fpu_escape(opcode, modrm, ea); }
 			cpu.ip += 2;
 			if (mod != 3) {
 				handle_modrm_ip(modrm);

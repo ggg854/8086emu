@@ -87,10 +87,10 @@ typedef struct {
 
 extern ProtectState286 protect;
 
-// ---- TEMP 保护模式流程追踪（交付前删除） ----
+// ---- 保护模式流程日志（默认关闭，只对 -dbg 生效）----
 #include <stdio.h>
-extern int pm_log_budget;
-#define PMLOG(...) do { if (pm_log_budget > 0) { pm_log_budget--; \
+extern bool debug_mode;
+#define PMLOG(...) do { if (debug_mode) { \
 	fprintf(stderr, __VA_ARGS__); fflush(stderr); } } while (0)
 
 void protect_init(void);

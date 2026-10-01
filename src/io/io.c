@@ -43,6 +43,18 @@ static bool     kbd_in_full   = false;
 // 0xD1 写输出端口后记录的值（bit1 是 A20/复位相关，XT 无用但保留）
 static uint8_t  kbd_out_port  = 0;
 
+// 8042 输入端口 P1（主板配置开关/跳线），用命令 0xC0 读出。
+//   bit7 = 键盘锁开关（1=锁定）
+//   bit6 = 显示类型（1=彩色 CGA/EGA，0=单色 MDA）
+//   bit5 = manufacturing 跳线（1=制造测试模式）
+//   bit4 = 主板 RAM 容量（？）
+// AT POST 把 (P1 & 0xF8) 抄进 BDA 0x12，后面多处 gating 都用它：
+//   F000:1217 bit5=1 → 不装 INT8 向量且不解屏蔽 IRQ0（制造模式）
+//   F000:12D8 bit5=0 → 跳过制造诊断块
+//   F000:156F bit5=0 → 按 F1 重跑 POST（制造模式下才走 resume）
+// 本机只有 CGA（彩色）、键盘锁未锁、非制造模式 → 0x40
+static uint8_t  kbd_p1 = 0x40;
+
 // 下一个写到 0x60 的字节归属
 static enum { W_NONE = 0, W_CFG, W_OUTPORT, W_AUX } kbd_wait = W_NONE;
 
@@ -803,6 +815,15 @@ static void cmos_update_time(void) {
   cmos_rtc[0x32] = rtc_enc((uint8_t)((tm->tm_year + 1900) / 100));
 }
 
+// 配置校验和重算：POST 的校验例程（F000:06FE）把 0x10~0x2D 逐字节累加成 16 位，
+// 要求它等于 0x2E/0x2F 组成的"大端"字（高字节在 0x2E）。
+static void cmos_update_checksum(void) {
+  uint16_t sum = 0;
+  for (int i = 0x10; i <= 0x2D; i++) sum += cmos_rtc[i];
+  cmos_rtc[0x2E] = (uint8_t)(sum >> 8);
+  cmos_rtc[0x2F] = (uint8_t)(sum & 0xFF);
+}
+
 // 预置一套"与模拟硬件一致"的有效配置 + 校验和，让 AT POST 不再报 162。
 //   配置区 0x10~0x2D 的 16 位累加和必须为 0，故把 0x2E/0x2F 填成它的补码。
 static void cmos_init(void) {
@@ -813,22 +834,112 @@ static void cmos_init(void) {
   cmos_rtc[0x0B] = 0x02;   // BCD 编码、24 小时制
   cmos_rtc[0x0D] = 0x80;   // 电池有效（RAM 与时间有效，POST 不报 163）
   cmos_rtc[0x0F] = 0x00;   // 关机状态：正常加电
+  cmos_rtc[0x0E] = 0x00;   // 诊断状态：bit7=配置无效 bit6=校验和错 bit5=配置不一致
   // ---- 设备配置（必须和模拟出的硬件吻合，否则 POST 报 162）----
   cmos_rtc[0x10] = 0x44;   // 软盘 A:/B: 都是 1.44MB（类型 4）
   cmos_rtc[0x12] = 0x02;   // 硬盘 C: 类型 2（615 柱面 × 4 磁头 × 17 扇区 ≈ 20MB）
-  cmos_rtc[0x14] = 0x6D;   // 设备字节：有软驱(bit0)、板载 RAM 64K(bits2-3)、
-                           //   初始显示 80x25(bits4-5)、软驱 2 台(bits6-7=1)
+  cmos_rtc[0x14] = 0x4F;   // 设备字节：有软驱(bit0)、80287 存在(bit1)、软驱 2 台(bits6-7=01)。
+                           //   bit1 必须为 1：模拟器的 287 能被 POST 的 fninit/fnstcw 探测到
+                           //   （F000:1497 探测成功 → AH=2），若设备字 bit1=0 则不一致 → 报 162。
+                           //   初始显示位 bits4-5 必须为 0：POST（F000:09D1）只要该位非 0
+                           //   就跳到 F000:0A38 把 0x0E 置 bit5 → 报 162。显示交给 C0000
+                           //   的选件 ROM，设备字节里不写主板显示类型。
   cmos_rtc[0x15] = 0x80;   // 基本内存 640 KB（低字节）
   cmos_rtc[0x16] = 0x02;   // 基本内存 640 KB（高字节）
   cmos_rtc[0x17] = 0x00;   // 扩展内存（1MB 以上，1K 为单位）= 1024 KB (0x0400)
   cmos_rtc[0x18] = 0x04;   //   2MB 总内存 − 1MB = 1MB，需与板上 RAM 一致否则报 164
   cmos_rtc[0x32] = 0x20;   // 世纪（后面的读取会用宿主时间覆盖）
   // ---- 配置校验和 ----
-  uint16_t sum = 0;
-  for (int i = 0x10; i <= 0x2D; i++) sum += cmos_rtc[i];
-  sum = (uint16_t)(0u - sum);
-  cmos_rtc[0x2E] = (uint8_t)(sum & 0xFF);
-  cmos_rtc[0x2F] = (uint8_t)(sum >> 8);
+  //   5170 POST 的校验例程（F000:06FE）：把 0x10~0x2D 逐字节累加成 16 位，
+  //   然后要求它等于 0x2E/0x2F 组成的"大端"字（高字节在 0x2E）。等于即通过，
+  //   不等（或累加和为 0）→ 置 0x0E bit6 → 报 162。
+  cmos_update_checksum();
+}
+
+// ============================================================
+// CMOS 持久化（当前目录的 cmos.rom）
+//   真机的 MC146818 由电池保持，断电后配置仍在 —— 162 这类"配置未设置"错误在
+//   真机上的处理就是插 SETUP 盘写一次，之后一直有效。要复现这个体验，CMOS 内容
+//   必须跨会话保留：
+//     · 启动：cmos.rom 存在就读回，客机看到的就是上次的配置（含 POST/SETUP 写回的）
+//     · 不存在：用 cmos_init() 预置一套与模拟硬件一致的有效配置并立刻保存
+//     · 客机写 0x71 / 进程退出：落盘，异常退出也不丢
+// ============================================================
+#define CMOS_FILE "cmos.rom"
+
+static void cmos_save(void) {
+  FILE* fp = fopen(CMOS_FILE, "wb");
+  if (!fp) return;
+  fwrite(cmos_rtc, 1, sizeof(cmos_rtc), fp);
+  fclose(fp);
+}
+
+static bool cmos_load(void) {
+  FILE* fp = fopen(CMOS_FILE, "rb");
+  if (!fp) return false;
+  size_t rd = fread(cmos_rtc, 1, sizeof(cmos_rtc), fp);
+  fclose(fp);
+  return rd == sizeof(cmos_rtc);
+}
+
+// 软驱类型编码（CMOS 0x10：高 4 位 = A:，低 4 位 = B:）
+//   0=无  1=360KB  2=1.2MB  3=720KB  4=1.44MB（与 fdc.c 的 media_geometry 对应）
+static uint8_t cmos_floppy_type(uint32_t size) {
+  if (size == 1474560) return 4;
+  if (size == 1228800) return 2;
+  if (size ==  737280) return 3;
+  if (size ==  368640) return 1;
+  return 1;                 // 其它大小按 360KB（与 fdc.c 的缺省一致）
+}
+
+// 把 CMOS 的软驱配置与实际挂载的镜像对齐。
+//   AT POST 把自己探测到的软驱类型与 CMOS 0x10 比对，不符就置 0x0E 的 bit5
+//   （配置不一致）→ 报 162。旧代码把 0x10 硬编码成 0x44（A:/B: 都是 1.44MB），
+//   而实际挂的是 5.25" 360KB 镜像，必然 162。
+//   ★ 必须在 ide_mount_floppy 之后调用（镜像大小那时才确定）。
+void io_cmos_sync_floppies(void) {
+  uint8_t a = floppy_get_data(0) ? cmos_floppy_type(floppy_get_size(0)) : 0;
+  uint8_t b = floppy_get_data(1) ? cmos_floppy_type(floppy_get_size(1)) : 0;
+  int n = (a ? 1 : 0) + (b ? 1 : 0);
+
+  cmos_rtc[0x10] = (uint8_t)((a << 4) | b);
+  // 设备字节 0x14：bit0 = 装了软驱；bits6-7 = 软驱台数−1（保留 bit1~bit5 原值）
+  cmos_rtc[0x14] &= (uint8_t)~0xC1;
+  if (n) {
+    cmos_rtc[0x14] |= 0x01;
+    cmos_rtc[0x14] |= (uint8_t)((n - 1) << 6);
+  }
+  cmos_update_checksum();
+  fprintf(stderr, "[CMOS] 软驱 A:=%u B:=%u → 0x10=%02X 0x14=%02X (chk=%02X%02X)\n",
+          a, b, cmos_rtc[0x10], cmos_rtc[0x14], cmos_rtc[0x2E], cmos_rtc[0x2F]);
+}
+
+// ============================================================
+// 补齐 POST 漏掉的软驱设备位
+//   POST 在 F000:124A 用 testb $0x1,0x10 判断有没有软驱，为 0 就整段跳过软驱
+//   自检（连带跳过 F000:1264 的 INT 13h AH=00）。而 BDA 0x10 是 POST 在
+//   F000:0A5E 用 and $0x3e（0x3E = 0011 1110）从 CMOS 设备字节派生的 ——
+//   这一步把 bit0（有软驱）和 bits6-7（软驱台数）永久丢掉了，于是形成死锁：
+//     没有软驱标志 → 不做软驱自检 → BDA 0x90/0x91 软驱类型不填 →
+//     INT 19h 从 A: 引导失败 → 回 F000:0050 重启 → 循环
+//   真机由「把 CMOS 0x10 的软驱类型复制到 BDA 0x90/0x91 并置设备位」的例程打破，
+//   该例程在本模拟器中从未执行（实测 BDA 0x490 只被内存测试写过 0x55/0x00），
+//   所以这里按当前 CMOS 配置补齐 —— 只读 CMOS，不臆造硬件。
+//   ★ 必须在实模式调用（这里走 write_byte/write_word 会过保护模式限长检查）。
+// ============================================================
+static void post_fixup_floppy_equip(void) {
+    uint8_t a = (uint8_t)(cmos_rtc[0x10] >> 4);      // A: 类型（高 4 位）
+    uint8_t b = (uint8_t)(cmos_rtc[0x10] & 0x0F);    // B: 类型（低 4 位）
+    int n = (a ? 1 : 0) + (b ? 1 : 0);
+    if (!n) return;
+
+    write_byte(0x0040, 0x0090, a);                   // BDA 0x90：A: 类型
+    write_byte(0x0040, 0x0091, b);                   // BDA 0x91：B: 类型
+
+    uint16_t eq = read_word(0x0040, 0x0010);
+    eq |= 0x0001;                                    // bit0 = 装了软驱
+    eq = (uint16_t)((eq & ~0x00C0) | ((n - 1) << 6)); // bits6-7 = 台数−1
+    write_word(0x0040, 0x0010, eq);
 }
 
 // ============================================================
@@ -1190,6 +1301,9 @@ void io_write_port(uint16_t port, uint8_t val) {
         case 0xAB:  // 键盘口测试 → 00h 通过
           kbd_out_buf = 0x00; kbd_out_full = true; kbd_out_aux = false;
           break;
+        case 0xC0:  // 读输入端口 P1（主板配置开关）→ 交付到输出缓冲
+          kbd_out_buf = kbd_p1; kbd_out_full = true; kbd_out_aux = false;
+          break;
         case 0xAD:  // 禁用键盘
           kbd_cmd_byte |= 0x10;
           break;
@@ -1279,7 +1393,19 @@ void io_write_port(uint16_t port, uint8_t val) {
       cmos_nmi_disabled = (val & 0x80) != 0;   // bit7 = NMI 屏蔽
       cmos_index = val & 0x7F;
       break;
-    case 0x71: cmos_rtc[cmos_index & 0x7F] = val; break;
+    case 0x71: {
+      cmos_rtc[cmos_index & 0x7F] = val;
+      cmos_save();          // ★ 客机对 CMOS 的改动立刻落盘（POST/SETUP 写回不丢）
+      break;
+    }
+
+    // ---- POST 诊断口（写进这里的值就是当前自检进度，无状态）----
+    //   AT 的 checkpoint 0x3C 是软驱初始化前一刻，POST 紧接着在 F000:124A 用
+    //   testb $0x1,0x10 检查 BDA 设备位 —— 在那一瞬间补齐它（见
+    //   post_fixup_floppy_equip 的说明）。
+    case 0x80:
+      if (val == 0x3C) post_fixup_floppy_equip();
+      break;
 
     // ---- 8255 端口 B ----
     case 0x61: ppi_port_b = val; break;
@@ -1373,5 +1499,12 @@ void io_reset(void) {
 // ============================================================
 __attribute__((constructor))
 static void io_init_constructor(void) {
-  cmos_init();
+  if (!cmos_load()) { cmos_init(); cmos_save(); }
+  // ★ shutdown byte（0x0F）语义上是"上一次关机/重启的方式"，真机一上电 BIOS 就
+  //   立刻把它清成 0（见 F000:00E7 的 out %al,$0x71）。它必须随会话重置：
+  //   若持久化了上次的 0x06，下次启动 F000:0050 的跳转表会把 POST 直接送进中段
+  //   （F000:10D8），从而跳过 F000:0693 那 120 个 IVT 向量的初始化 ——
+  //   结果 INT 19h 引导向量为空，POST 走到 checkpoint 3A 后一引导就跑飞。
+  cmos_rtc[0x0F] = 0x00;
+  atexit(cmos_save);   // 正常退出（窗口关闭 / -console 结束）时落盘
 }

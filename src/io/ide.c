@@ -412,29 +412,33 @@ void ide_cleanup(void) {
 // ============================================================
 uint8_t ide_read_port(uint16_t port) {
     switch (port) {
-        case 0x1F0: {                        // Data
-            if (!ide_drq) return 0;
-            uint8_t v = ide_buf.b[ide_buf_pos++];
-            vga_led_activity(0);             // 硬盘读写灯
-            if (ide_buf_pos >= IDE_SECTOR_SIZE) {
-                ide_buf_pos = 0;
-                if (ide_is_identify) {       // IDENTIFY：读完即结束
-                    ide_is_identify = false;
-                    ide_drq = false;
-                    ide_status = IDE_ST_READY;
-                } else {
-                    if (ide_sectors_left > 0) ide_sectors_left--;
-                    if (ide_sectors_left == 0) {
-                        ide_ok(true);        // 最后一个扇区读完：撤 DRQ + 投 IRQ14
-                    } else {
-                        ide_cur_lba++;
-                        if (!ide_load_sector(ide_cur_lba)) { ide_set_error(IDE_ERR_IDNF); return v; }
-                        ide_status = IDE_ST_DATA;   // 继续供下一个扇区
-                    }
-                }
-            }
-            return v;
-        }
+    case 0x1F0: {
+		if (!ide_drq) return 0;
+		uint8_t v = ide_buf.b[ide_buf_pos++];
+		vga_led_activity(0);
+		if (ide_buf_pos >= IDE_SECTOR_SIZE) {
+			ide_buf_pos = 0;
+			if (ide_is_identify) {
+				ide_is_identify = false;
+				ide_drq = false;
+				ide_status = IDE_ST_READY;
+			} else {
+				if (ide_sectors_left > 0) ide_sectors_left--;
+				if (ide_sectors_left == 0) {
+					ide_ok(true);
+				} else {
+					ide_cur_lba++;
+					if (!ide_load_sector(ide_cur_lba)) {
+						ide_set_error(IDE_ERR_IDNF);
+						return v;
+					}
+					ide_drq = true;               // ★ 加这行
+					ide_status = IDE_ST_DATA;
+				}
+			}
+		}
+		return v;
+	}
         case 0x1F1: return ide_error;
         case 0x1F2: return ide_sector_count;
         case 0x1F3: return ide_sector_num;
@@ -451,23 +455,25 @@ uint8_t ide_read_port(uint16_t port) {
 // ============================================================
 void ide_write_port(uint16_t port, uint8_t val) {
     switch (port) {
-        case 0x1F0: {                        // Data
-            if (!ide_drq || !ide_buf_is_write) break;
-            ide_buf.b[ide_buf_pos++] = val;
-            vga_led_activity(0);             // 硬盘读写灯
-            if (ide_buf_pos >= IDE_SECTOR_SIZE) {
-                ide_buf_pos = 0;
-                ide_store_sector(ide_cur_lba);
-                if (ide_sectors_left > 0) ide_sectors_left--;
-                if (ide_sectors_left == 0) {
-                    ide_ok(true);            // 最后一个扇区收完：撤 DRQ + 投 IRQ14
-                } else {
-                    ide_cur_lba++;
-                    ide_status = IDE_ST_DATA;   // 继续接收下一个扇区
-                }
-            }
-            break;
-        }
+    case 0x1F0: {
+		if (!ide_drq || !ide_buf_is_write) break;
+		ide_buf.b[ide_buf_pos++] = val;
+		vga_led_activity(0);
+		if (ide_buf_pos >= IDE_SECTOR_SIZE) {
+			ide_buf_pos = 0;
+			ide_store_sector(ide_cur_lba);
+			if (ide_sectors_left > 0) ide_sectors_left--;
+			if (ide_sectors_left == 0) {
+				ide_ok(true);
+			} else {
+				ide_cur_lba++;
+				memset(ide_buf.b, 0, IDE_SECTOR_SIZE);
+				ide_drq = true;               // ★ 加这行
+				ide_status = IDE_ST_DATA;
+			}
+		}
+		break;
+	}
         case 0x1F1: ide_features = val; break;
         case 0x1F2: ide_sector_count = val; break;
         case 0x1F3: ide_sector_num = val; break;
@@ -691,7 +697,7 @@ void ide_int13_handle(void) {
             break;
 
         case 0x08: {                     // 取驱动器参数
-            uint16_t last_cyl = IDE_CYLINDERS - 1;
+            uint16_t last_cyl = IDE_CYLINDERS - 2;
             uint8_t  spt      = (uint8_t)(IDE_SPT & 0x3F);
             uint8_t  cyl_hi   = (uint8_t)((last_cyl >> 8) & 0x03);
             cpu.cx = (uint16_t)(((uint16_t)cyl_hi << 6) | spt);          // CL

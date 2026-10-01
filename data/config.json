@@ -1,0 +1,10 @@
+{
+  "bios":"D:\\dos86\\data\\IBMATBIOS.BIN",
+  "disk":"D:\\dos86\\data\\dos.img",
+  "floppy_a":"C:\\Users\\ASUS\\Desktop\\DISK01.IMG",
+  "floppy_b":"D:\\downl\\Microsoft Windows 2.03 (5.25)\\Microsoft Windows 2.03 (5.25)\\D1_Setup.img",
+  "cpu_mhz":20,
+  "composite":false,
+  "console":false,
+  "debug":false
+}

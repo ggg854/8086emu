@@ -281,6 +281,9 @@ void fdc_reset(void) {
 // ============================================================
 static void fdc_execute(void) {
   phase = PH_IDLE;                           // 默认：命令结束后没有结果相位
+  if (debug_mode)
+    fprintf(stderr, "[FDCCMD] op=%02X n=%d p=%02X %02X %02X %02X pcnA=%u pcnB=%u\n",
+            opcode, cmd_len, cmd[1], cmd[2], cmd[3], cmd[4], pcn[0], pcn[1]);
 
   switch (opcode & 0x1F) {
     case 0x03: {                             // SPECIFY：无结果、无中断

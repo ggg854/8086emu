@@ -33,4 +33,9 @@ void io_serial_poll(void); // IRQ4（COM1 收数据 → INT 0Ch），串口鼠�
 // 机器复位（GTK「重启」按钮）：键盘/PIC/PIT/PPI 回到上电默认值
 void io_reset(void);
 
+// 把 CMOS 的软驱配置（0x10 / 0x14）与实际挂载的镜像对齐并重算校验和。
+// 必须在 ide_mount_floppy 之后调用 —— 镜像大小那时才确定；不对齐会让 AT POST
+// 判「配置不一致」→ 报 162。
+void io_cmos_sync_floppies(void);
+
 #endif
