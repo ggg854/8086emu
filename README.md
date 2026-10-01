@@ -1,9 +1,8 @@
-<img width="646" height="479" alt="image" src="https://github.com/user-attachments/assets/b87f7a1d-c861-42bf-b779-c354f4568fc1" />
-<img width="636" height="481" alt="image" src="https://github.com/user-attachments/assets/49ad3c76-14d3-4bd8-ba45-544c0ad076d8" />
-<img width="644" height="421" alt="image" src="https://github.com/user-attachments/assets/cc5f6999-dffb-46a8-a3b4-a760db3400ab" />
-<img width="644" height="484" alt="image" src="https://github.com/user-attachments/assets/29e62587-a5b2-4bce-845f-0ca8e165ed2b" />
+<img width="641" height="421" alt="image" src="https://github.com/user-attachments/assets/70e36a4f-eda3-491e-b154-0b97c87f0b15" />
+<img width="640" height="470" alt="image" src="https://github.com/user-attachments/assets/6c6527e1-0873-4c92-a546-173a44861738" />
 
-it's ONLY can select CGA driver(VGA driver is black screen)
+
+it's ONLY can select CGA driver(VGA driver is black screen) windows2.03
 
 \# 8086/80286 PC Emulator
 WARNING: This binary is NOT statically linked.
@@ -44,7 +43,7 @@ supports hard disk, floppy, FPU, and 80286 protected mode.
 
 \- ✅ \*\*PCXTBIOS (Turbo XT BIOS v2.5)\*\* — works
 
-\- ❌ \*\*IBM PC/AT BIOS\*\* — currently fails with a #NP fault storm. \*\*Help wanted.\*\*
+\- ❌ \*\*IBM PC/AT BIOS\*\* — currently fails with a triple fault(cpu fly). \*\*Help wanted.\*\*
 
 
 
@@ -60,5 +59,5 @@ supports hard disk, floppy, FPU, and 80286 protected mode.
 
 make
 
-./8086emu
+make run
 
