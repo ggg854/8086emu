@@ -20,6 +20,9 @@ uint64_t insn_count = 0;   // 非 static：fdc.c 诊断用
 static uint32_t last_sec = 0;
 static uint64_t last_cyc = 0;
 
+static GtkWidget* g_manager = NULL;             // 机器管理菜单窗口
+static void emu_shutdown(bool destroy_window);   // 机器管理菜单：关模拟器回到主菜单
+
 // ★ 客机主频：20MHz（Turbo XT）。宏定义见 cpu.h（CPU_CLK_HZ）。
 //   "1 毫秒走 20000 个周期"，周期数由 cpu.c 的 8088 周期表给出。
 //   PIT（CPU_CLK_HZ/PIT_CLK_HZ 分频）与 0x3DA 视频时序都按各自的板级时钟换算，
@@ -257,11 +260,7 @@ gboolean vga_on_button_release(GtkWidget* widget, GdkEventButton* event, gpointe
 
 static gboolean on_delete_event(GtkWidget* widget, GdkEvent* event, gpointer data) {
     (void)widget; (void)event; (void)data;
-    emu_running = false;
-    cpu_running = false;
-    ide_cleanup();
-    vga_cleanup();
-    exit(0);
+    emu_shutdown(false);   // 关模拟器窗口 → 回到机器管理菜单（不退出程序）
     return FALSE;
 }
 
@@ -294,6 +293,8 @@ static gpointer con_reader(gpointer arg) {
         if (c == 0x03 || c == 0x1A) break;   // Ctrl+C / Ctrl+Z
         con_push_byte((uint8_t)c);
     }
+    // 有机器管理菜单时（g_manager 存在），Ctrl+C 只停模拟器、回到菜单，不杀进程
+    if (g_manager) emu_running = false;
     // ★ EOF 不再退出模拟器：无头/管道场景 stdin 可能提前关闭（或压根没接终端），
     //   此时若直接退出，主循环连一条指令都跑不了，无法用于自动化引导测试。
     //   仅 Ctrl+C(0x03)/Ctrl+Z(0x1A) 主动退出；其余情况停掉读取线程、主循环继续跑。
@@ -423,10 +424,10 @@ static gboolean tick(gpointer data) {
     (void)data;
     static int halt_reported = 0;
 
-    // 用户点了 ×，真正退出
+    // 用户点了 × 或按 F12：关模拟器窗口、回到机器管理菜单（不退出程序）
     if (!emu_running) {
-        if (!console_mode) gtk_main_quit();
-        return console_mode ? TRUE : FALSE;
+        emu_shutdown(!console_mode);
+        return FALSE;
     }
 
     // ★ CPU 停了：继续渲染，不退出
@@ -784,8 +785,8 @@ static void print_usage(const char* exe) {
 "IBM PC Emulator - 8086/8088 (GTK frontend / -console headless)\n"
 "\n"
 "Usage: %s [options]\n"
-"With no options: pops up GTK dialogs to select BIOS, hard disk, floppy A:, floppy B:\n"
-"                 (cancel to use defaults).\n"
+"With no options: opens the Machine Manager (list / start / create / edit / delete\n"
+"                 machines). Each machine is stored as machines/<name>.json.\n"
 "\n"
 "Options:\n"
 "  -help                show this help\n"
@@ -798,7 +799,7 @@ static void print_usage(const char* exe) {
 "  -dbg                 enable debug log\n"
 "  -config <file>       config file (default: config.json)\n"
 "\n"
-"Giving any of the options above skips the startup config dialog.\n"
+"Giving any of the options above skips the Machine Manager and starts directly.\n"
 "\n"
 "At runtime: use the 'Machine' menu to swap floppies A:/B: or reset;\n"
 "            use the 'Frequency' menu to change the emulated CPU clock.\n", exe);
@@ -871,6 +872,12 @@ void ui_reset_machine(void) {
 }
 
 void init_emulator(const Config* cfg) {
+    // 内存容量（MB）："随便调"。优先用配置，缺省 8MB；至少 1MB（要装下 F0000 的 ROM）。
+    uint32_t ram = (cfg->ram_mb > 0 ? (uint32_t)cfg->ram_mb : MACHINE_RAM_DEF) * 1024u * 1024u;
+    if (ram < 0x100000) ram = 0x100000;
+    if (memory) { free(memory); memory = NULL; }
+    memory_size = ram;
+
     cpu_init();
 
     if (cfg->console) vga_set_headless(true);
@@ -914,6 +921,205 @@ void init_emulator(const Config* cfg) {
                      G_CALLBACK(on_window_destroy), NULL);
 
     gtk_widget_grab_focus(vga.drawing_area);
+}
+
+// ============================================================
+// Machine manager (two-level menu)
+//   Level 1: list of all created machines; click to start. Buttons:
+//            Start / New machine / Edit config / Delete / Exit.
+//   Level 2: create / edit dialog (machine_edit_dialog); machine name IS the
+//            file name (no spaces allowed).
+// ============================================================
+static GtkListBox* g_mlist   = NULL;
+static guint       g_tick    = 0;
+static bool        g_emu_active = false;
+
+static void manager_refresh(void);
+static void do_launch(const char* name);
+
+// Shut down the running emulator, free resources, return to the manager window.
+static void emu_shutdown(bool destroy_window) {
+    if (!g_emu_active) return;
+    g_emu_active = false;
+    if (g_tick) { g_source_remove(g_tick); g_tick = 0; }
+    emu_running = false;
+    cpu_running = false;
+    if (destroy_window && vga.window && !console_mode)
+        gtk_widget_destroy(vga.window);
+    vga_cleanup();
+    ide_cleanup();
+    if (memory) { free(memory); memory = NULL; }
+    memory_size = 0;
+    manager_refresh();
+    if (g_manager) gtk_widget_show_all(g_manager);
+}
+
+static void manager_refresh(void) {
+    if (!g_mlist) return;
+    GList* rows = gtk_container_get_children(GTK_CONTAINER(g_mlist));
+    for (GList* r = rows; r; r = r->next) gtk_widget_destroy(GTK_WIDGET(r->data));
+    g_list_free(rows);
+
+    GList* names = machine_list();
+    for (GList* n = names; n; n = n->next) {
+        const char* nm = (const char*)n->data;
+        GtkWidget* row = gtk_list_box_row_new();
+        GtkWidget* lbl = gtk_label_new(nm);
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        gtk_widget_set_margin_start(lbl, 6);
+        gtk_widget_set_margin_top(lbl, 4);
+        gtk_widget_set_margin_bottom(lbl, 4);
+        gtk_container_add(GTK_CONTAINER(row), lbl);
+        g_object_set_data_full(G_OBJECT(row), "name", g_strdup(nm), g_free);
+        gtk_list_box_insert(g_mlist, row, -1);
+    }
+    g_list_free_full(names, g_free);
+}
+
+static void machine_err(const char* msg) {
+    GtkWidget* d = gtk_message_dialog_new(GTK_WINDOW(g_manager), GTK_DIALOG_MODAL,
+                                          GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "%s", msg);
+    gtk_dialog_run(GTK_DIALOG(d));
+    gtk_widget_destroy(d);
+}
+
+// Start a machine: load config -> hide menu -> run the emulator (GTK window or -console).
+static void do_launch(const char* name) {
+    Config cfg;
+    if (!machine_load(name, &cfg)) {
+        machine_err("Cannot load this machine's config.");
+        return;
+    }
+    console_mode = cfg.console;
+    debug_mode   = cfg.debug;
+    gtk_widget_hide(g_manager);
+    init_emulator(&cfg);
+
+    if (console_mode) {
+        g_emu_active = true;
+        printf("[CONSOLE] terminal mode, Ctrl+C to quit\n");
+        fputs("\x1b[2J\x1b[H", stdout);
+        memset(con_shadow, 0, sizeof(con_shadow));
+        g_thread_new("con-in", con_reader, NULL);
+        while (emu_running && g_emu_active) {
+            tick(NULL);
+            con_poll_input();
+            con_render();
+            g_usleep(1000);
+        }
+        emu_shutdown(false);
+    } else {
+        g_emu_active = true;
+        g_tick = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, tick, NULL, NULL);
+    }
+}
+
+static const char* manager_selected(void) {
+    GtkListBoxRow* row = gtk_list_box_get_selected_row(g_mlist);
+    if (!row) return NULL;
+    return (const char*)g_object_get_data(G_OBJECT(row), "name");
+}
+
+static void on_row_activated(GtkListBox* box, GtkListBoxRow* row, gpointer d) {
+    (void)box; (void)row; (void)d;
+    const char* name = manager_selected();
+    if (name) do_launch(name);
+}
+static void on_launch_clicked(GtkWidget* b, gpointer d) {
+    (void)b; (void)d;
+    const char* name = manager_selected();
+    if (name) do_launch(name);
+    else machine_err("Please select a machine first.");
+}
+static void on_new_clicked(GtkWidget* b, gpointer d) {
+    (void)b; (void)d;
+    Config cfg; memset(&cfg, 0, sizeof(cfg));
+    const char* def = find_default_bios();
+    if (def) strncpy(cfg.bios, def, sizeof(cfg.bios) - 1);
+    cfg.cpu_mhz = 20; cfg.ram_mb = MACHINE_RAM_DEF;
+    char name[256]; name[0] = 0;
+    if (machine_edit_dialog(&cfg, name, sizeof(name), true)) {
+        machine_save(name, &cfg);
+        manager_refresh();
+    }
+}
+static void on_edit_clicked(GtkWidget* b, gpointer d) {
+    (void)b; (void)d;
+    const char* sel = manager_selected();
+    if (!sel) { machine_err("Please select a machine first."); return; }
+    Config cfg;
+    if (!machine_load(sel, &cfg)) { machine_err("Cannot load this machine's config."); return; }
+    char name[256]; strncpy(name, sel, sizeof(name) - 1); name[sizeof(name) - 1] = 0;
+    if (machine_edit_dialog(&cfg, name, sizeof(name), false)) {
+        machine_save(name, &cfg);
+        manager_refresh();
+    }
+}
+static void on_del_clicked(GtkWidget* b, gpointer d) {
+    (void)b; (void)d;
+    const char* sel = manager_selected();
+    if (!sel) { machine_err("Please select a machine first."); return; }
+    GtkWidget* q = gtk_message_dialog_new(GTK_WINDOW(g_manager), GTK_DIALOG_MODAL,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO, "Delete machine '%s'?", sel);
+    int r = gtk_dialog_run(GTK_DIALOG(q));
+    gtk_widget_destroy(q);
+    if (r == GTK_RESPONSE_YES) { machine_delete(sel); manager_refresh(); }
+}
+static void on_quit_clicked(GtkWidget* b, gpointer d) {
+    (void)b; (void)d;
+    gtk_main_quit();
+}
+static gboolean on_manager_delete(GtkWidget* w, GdkEvent* e, gpointer d) {
+    (void)w; (void)e; (void)d;
+    gtk_main_quit();
+    return FALSE;
+}
+
+static void open_manager(void) {
+    if (g_manager) { gtk_widget_show_all(g_manager); return; }
+    g_manager = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(g_manager), "IBM PC Emulator - Machine Manager");
+    gtk_window_set_default_size(GTK_WINDOW(g_manager), 440, 480);
+    g_signal_connect(g_manager, "delete-event", G_CALLBACK(on_manager_delete), NULL);
+
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 12);
+
+    GtkWidget* title = gtk_label_new("Select a machine to start, or create / edit / delete:");
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(vbox), title, FALSE, FALSE, 0);
+
+    GtkWidget* scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    g_mlist = GTK_LIST_BOX(gtk_list_box_new());
+    gtk_list_box_set_selection_mode(g_mlist, GTK_SELECTION_SINGLE);
+    g_signal_connect(g_mlist, "row-activated", G_CALLBACK(on_row_activated), NULL);
+    gtk_container_add(GTK_CONTAINER(scroll), GTK_WIDGET(g_mlist));
+    gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
+
+    GtkWidget* hbox = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_button_box_set_layout(GTK_BUTTON_BOX(hbox), GTK_BUTTONBOX_SPREAD);
+    GtkWidget* b_launch = gtk_button_new_with_label("Start");
+    GtkWidget* b_new    = gtk_button_new_with_label("New machine");
+    GtkWidget* b_edit   = gtk_button_new_with_label("Edit config");
+    GtkWidget* b_del    = gtk_button_new_with_label("Delete");
+    GtkWidget* b_quit   = gtk_button_new_with_label("Exit");
+    g_signal_connect(b_launch, "clicked", G_CALLBACK(on_launch_clicked), NULL);
+    g_signal_connect(b_new,    "clicked", G_CALLBACK(on_new_clicked),    NULL);
+    g_signal_connect(b_edit,   "clicked", G_CALLBACK(on_edit_clicked),   NULL);
+    g_signal_connect(b_del,    "clicked", G_CALLBACK(on_del_clicked),    NULL);
+    g_signal_connect(b_quit,   "clicked", G_CALLBACK(on_quit_clicked),   NULL);
+    gtk_box_pack_start(GTK_BOX(hbox), b_launch, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox), b_new,    TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox), b_edit,   TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox), b_del,    TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox), b_quit,   TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
+
+    gtk_container_add(GTK_CONTAINER(g_manager), vbox);
+    manager_refresh();
+    gtk_widget_show_all(g_manager);
 }
 
 int main(int argc, char* argv[]) {
@@ -980,45 +1186,46 @@ int main(int argc, char* argv[]) {
         if (d) strncpy(cfg.bios, d, sizeof(cfg.bios) - 1);
     }
 
-    // 既然给了命令行机器选项：直接启动，不弹配置窗口、不回写配置
-    if (!cli_mode) {
-        if (!config_dialog(&cfg)) {
-            printf("Cancelled.\n");
-            return 0;
-        }
+    // Command-line machine options given -> start directly (no menu, no config write-back).
+    // Otherwise -> open the machine manager (two-level menu).
+    if (cli_mode) {
         if (config_save(config_path, &cfg))
             printf("[CONFIG] saved to %s\n", config_path);
         else
             fprintf(stderr, "[CONFIG] failed to save %s\n", config_path);
-    }
 
-    printf("IBM PC Emulator\n\n");
+        printf("IBM PC Emulator\n\n");
 
-    // 启动
-    if (cfg.console) console_mode = true;
-    debug_mode = cfg.debug;
+        if (cfg.console) console_mode = true;
+        debug_mode = cfg.debug;
+        init_emulator(&cfg);
 
-    init_emulator(&cfg);
-
-    if (console_mode) {
-        printf("[CONSOLE] terminal mode, Ctrl+C to quit\n");
-        fputs("\x1b[2J\x1b[H", stdout);
-        memset(con_shadow, 0, sizeof(con_shadow));
-        g_thread_new("con-in", con_reader, NULL);
-        while (emu_running) {
-            tick(NULL);
-            con_poll_input();
-            con_render();
-            g_usleep(1000);
+        if (console_mode) {
+            printf("[CONSOLE] terminal mode, Ctrl+C to quit\n");
+            fputs("\x1b[2J\x1b[H", stdout);
+            memset(con_shadow, 0, sizeof(con_shadow));
+            g_thread_new("con-in", con_reader, NULL);
+            while (emu_running) {
+                tick(NULL);
+                con_poll_input();
+                con_render();
+                g_usleep(1000);
+            }
+            printf("\nEmulator stopped.\n");
+            ide_cleanup();
+            return 0;
         }
-        printf("\nEmulator stopped.\n");
+
+        g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, tick, NULL, NULL);
+        while (emu_running) gtk_main();
+        printf("Emulator stopped.\n");
         ide_cleanup();
         return 0;
     }
 
-    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, tick, NULL, NULL);
-    while (emu_running) gtk_main();
-    printf("Emulator stopped.\n");
+    // No command-line arguments: enter the machine manager menu.
+    open_manager();
+    gtk_main();
     ide_cleanup();
     return 0;
 }
