@@ -1015,9 +1015,14 @@ void cpu_execute_instruction(void) {
         }
         uint8_t next = MEM(addr + p);
 
+        // ★ 0x6C/0x6D/0x6E/0x6F = 串 I/O（INSB/INSW/OUTSB/OUTSW），也必须支持 REP。
+        //   漏了它们的话，AT 硬盘 BIOS 的 rep insw / rep outsw 会被当成"孤立的 REP
+        //   前缀"，后面的串指令只执行一次（搬 1 个字就往下走），IDE 的 512 字节
+        //   永远凑不满 → DRQ 不清 → 命令反复重发直到超时（fdisk 报读盘错误/卡死）。
         if (next == 0xA4 || next == 0xA5 || next == 0xA6 || next == 0xA7 ||
             next == 0xAA || next == 0xAB || next == 0xAC || next == 0xAD ||
-            next == 0xAE || next == 0xAF) {
+            next == 0xAE || next == 0xAF ||
+            next == 0x6C || next == 0x6D || next == 0x6E || next == 0x6F) {
 
             cpu.ip += p;                   // 跳过 F2/F3 及其后的所有前缀
             uint32_t base_ip = cpu.ip;      // 指向字符串指令
