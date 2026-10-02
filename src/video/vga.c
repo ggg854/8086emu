@@ -562,8 +562,10 @@ static void comp_prepare(void) {
 }
 
 // 伪色+ 增强参数（直接写死，改这里调效果）
-#define COMP_SAT  1.30f   // 色度增益：1.0=原版，>1 更艳
-#define COMP_CON  1.10f   // 对比度：1.0=原版
+//   之前 COMP_SAT=1.30 / COMP_CON=1.10 会把画面整体提亮、像蒙了一层浅白滤镜，
+//   现在归一到 1.0（忠实 NTSC 复合伪色原貌）。
+#define COMP_SAT  1.00f   // 色度增益：1.0=原版，>1 更艳
+#define COMP_CON  1.00f   // 对比度：1.0=原版
 #define COMP_BRI  0.00f   // 亮度偏移：0.0=原版
 
 static uint32_t comp_px(const uint8_t* idx, int w, int spp, int p) {
@@ -857,7 +859,11 @@ bool vga_render(void) {
             static uint32_t line[320];
             for (int y = 0; y < 200; y++) {
                 // 逐行取当时的 0x3D9：8088MPH 靠逐行改背景色把色度相位偏移，生成伪色
-                uint8_t creg = (cga_line_fid[y] == cga_frame_id) ? cga_line_color[y] : cga_color_reg;
+                // ★ 旧实现用 cga_line_fid[y]==cga_frame_id 判定逐行回退，但写 0x3D9 时
+                //   由 vga_current_scanline() 反推的扫描行与渲染的 y 常对不齐，导致大多数
+                //   行回退到 cga_color_reg（若被程序设成亮/白色）→ 整屏白屏并逐帧闪烁。
+                //   改为统一用当前 cga_color_reg：标准 CGA 复合伪色，稳定且颜色正确。
+                uint8_t creg = cga_color_reg;
                 uint8_t pidx[4];
                 pidx[0] = creg & 0x0F;
                 if (cga_bw) {
@@ -916,12 +922,12 @@ bool vga_render(void) {
             static uint8_t  idx[640];
             static uint32_t line[640];
             // 模式 6（640x200 2 色）前景恒为白(15)，背景 = 0x3D9 位 0-3。
-            // 8088MPH 通过改变背景色寄存器把色度相位偏移，生成复合伪色（1024 色），
-            // 故背景必须用真实调色板色（带 chroma），不能用硬编码的 0（黑），否则
-            // 伪色相位恒定、整幅画面颜色错乱。逐行取当时的 0x3D9 才能还原移相。
+            // 背景用真实调色板色（带 chroma），不能用硬编码的 0（黑），否则伪色相位
+            // 恒定、整幅画面颜色错乱。统一用当前 cga_color_reg（逐行阴影回退已移除，
+            // 因其扫描行对不齐会导致白屏闪烁）。
             uint8_t fg6 = 0x0F;
             for (int y = 0; y < 200; y++) {
-                uint8_t creg = (cga_line_fid[y] == cga_frame_id) ? cga_line_color[y] : cga_color_reg;
+                uint8_t creg = cga_color_reg;
                 uint8_t bg6 = creg & 0x0F;
                 int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
                 const uint8_t* src = &memory[base];
