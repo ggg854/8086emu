@@ -416,53 +416,55 @@ void vga_cleanup(void) {
 // ============================================================
 void vga_set_mode(VideoMode mode) {
   vga.mode = mode;
-  fprintf(stderr, "[VGA] set_mode %d\n", mode);
+  if (debug_mode) fprintf(stderr, "[VGA] set_mode %d\n", mode);
+
+  int nw = vga.width, nh = vga.height;
   switch (mode) {
-    case MODE_TEXT_80x25: vga.width = 640; vga.height = 400; break;
-    case MODE_TEXT_40x25: vga.width = 320; vga.height = 400; break;
-    case MODE_GFX_640x480: vga.width = 640; vga.height = 480; break;
-    case MODE_GFX_320x200: vga.width = 320; vga.height = 200; break;
+    case MODE_TEXT_80x25: nw = 640; nh = 400; break;
+    case MODE_TEXT_40x25: nw = 320; nh = 400; break;
+    case MODE_GFX_640x480: nw = 640; nh = 480; break;
+    case MODE_GFX_320x200: nw = 320; nh = 200; break;
     // CGA 图形：内部按 640x400 呈现（横向/纵向各放大一倍，保持 4:3 比例）
-    case MODE_CGA_320x200: vga.width = 640; vga.height = 400; break;
-    case MODE_CGA_640x200: vga.width = 640; vga.height = 400; break;
+    case MODE_CGA_320x200: nw = 640; nh = 400; break;
+    case MODE_CGA_640x200: nw = 640; nh = 400; break;
   }
 
-  if (vga.surface) cairo_surface_destroy(vga.surface);
-  if (vga.pixels) free(vga.pixels);
+  // ★ 只有画布尺寸真的变了才重建 surface / 改窗口尺寸。
+  //   CGA 的 320x200 与 640x200 都按 640x400 呈现；8088 MPH 之类演示常在同一帧里
+  //   快速切模式（320↔640）做滚动/多色效果，若每次都重建 surface + resize 窗口，
+  //   会严重闪屏。
+  bool dim_changed = (vga.pixels == NULL) || (nw != vga.width) || (nh != vga.height);
+  vga.width  = nw;
+  vga.height = nh;
 
-  if (!vga_headless) {
-    gtk_widget_set_size_request(vga.drawing_area, vga.width, vga.height + LED_BAR_H);
-    gtk_window_resize(GTK_WINDOW(vga.window), vga.width, vga.height + LED_BAR_H);
+  if (dim_changed) {
+    if (vga.surface) cairo_surface_destroy(vga.surface);
+    if (vga.pixels) free(vga.pixels);
+
+    if (!vga_headless) {
+      gtk_widget_set_size_request(vga.drawing_area, vga.width, vga.height + LED_BAR_H);
+      gtk_window_resize(GTK_WINDOW(vga.window), vga.width, vga.height + LED_BAR_H);
+    }
+
+    vga.pixels = malloc(vga.width * vga.height * sizeof(uint32_t));
+    memset(vga.pixels, 0, vga.width * vga.height * sizeof(uint32_t));
+
+    vga.surface = cairo_image_surface_create_for_data(
+      (unsigned char*)vga.pixels,
+      CAIRO_FORMAT_RGB24,
+      vga.width,
+      vga.height,
+      vga.width * sizeof(uint32_t));
   }
-
-  vga.pixels = malloc(vga.width * vga.height * sizeof(uint32_t));
-  memset(vga.pixels, 0, vga.width * vga.height * sizeof(uint32_t));
-
-  vga.surface = cairo_image_surface_create_for_data(
-    (unsigned char*)vga.pixels,
-    CAIRO_FORMAT_RGB24,
-    vga.width,
-    vga.height,
-    vga.width * sizeof(uint32_t));
 
   vga.cursor_x = 0;
   vga.cursor_y = 0;
   text_shadow_valid = false;
 
-  // 清屏
-  if (mode == MODE_TEXT_80x25 || mode == MODE_TEXT_40x25) {
-    int cols = (mode == MODE_TEXT_80x25) ? 80 : 40;
-    for (int i = 0; i < cols * 25; i++) {
-      memory[CGA_TEXT_ADDR + i * 2] = ' ';
-      memory[CGA_TEXT_ADDR + i * 2 + 1] = 0x07;
-    }
-  } else if (mode == MODE_CGA_320x200 || mode == MODE_CGA_640x200) {
-    memset(&memory[CGA_TEXT_ADDR], 0, CGA_GRAPHICS_SIZE);
-  } else if (mode == MODE_GFX_320x200) {
-    memset(&memory[VGA_GFX_ADDR], 0, 320 * 200);
-  } else if (mode == MODE_GFX_640x480) {
-    memset(&memory[VGA_GFX_ADDR], 0, 640 * 480 / 2);
-  }
+  // ★ 切模式时不再清显存：真实 CGA 通过端口 0x3D8 切模式不会清 VRAM，清屏由
+  //   BIOS（INT 10h set mode 自行填屏）或程序负责。每次切换都 memset 16KB 会把
+  //   演示刚画好的内容冲掉 —— 这正是"切模式做效果就闪屏/白屏"的根因。
+  //   复位路径由 vga_reset() → vga_clear() 负责清屏。
 
   if (!vga_headless) gtk_widget_grab_focus(vga.drawing_area);
 }
@@ -720,32 +722,9 @@ bool vga_render(void) {
 
         for (uint32_t i = 0; i < W * (uint32_t)vga.height; i++) px[i] = 0x000000;
 
-        if (cga_composite) {
-            comp_prepare();
-            int w = cols * 8;
-            int spp = (cols == 80) ? 1 : 2;
-            static uint8_t  idx[640];
-            static uint32_t line[640];
-            for (int row = 0; row < 25; row++) {
-                for (int y = 0; y < 16; y++) {
-                    for (int col = 0; col < cols; col++) {
-                        int offset = (row * 80 + col) * 2;
-                        uint8_t ch   = memory[CGA_TEXT_ADDR + offset];
-                        uint8_t attr = memory[CGA_TEXT_ADDR + offset + 1];
-                        uint8_t fg = attr & 0x0F;
-                        uint8_t bg = (attr >> 4) & 0x07;
-                        uint8_t bits = font8x16[ch][y];
-                        uint8_t* dst = &idx[col * 8];
-                        for (int x = 0; x < 8; x++)
-                            dst[x] = (bits & (0x80 >> x)) ? fg : bg;
-                    }
-                    for (int x = 0; x < w; x++) line[x] = comp_px(idx, w, spp, x);
-                    int dy = row * 16 + y;
-                    memcpy(&px[dy * W], line, (size_t)w * 4);
-                }
-            }
-        } else {
-            for (int row = 0; row < 25; row++) {
+        // 文本模式不套复合伪色：真实 CGA 文本用标准 16 色调色板显示，伪色只产生于
+        // 图形模式（每像素 1-2 位）。套伪色会把文字染成蓝/粉绿等 artifact 色，故禁用。
+        for (int row = 0; row < 25; row++) {
                 for (int col = 0; col < cols; col++) {
                     int offset = (row * 80 + col) * 2;
                     uint8_t ch   = memory[CGA_TEXT_ADDR + offset];
@@ -766,7 +745,6 @@ bool vga_render(void) {
                     }
                 }
             }
-        }
 
         // 光标
         int page = memory[0x462] & 0x07;
