@@ -893,6 +893,7 @@ void init_emulator(const Config* cfg) {
     ide_mount_floppy(0, cfg->floppy_a[0] ? cfg->floppy_a : NULL);
     ide_mount_floppy(1, cfg->floppy_b[0] ? cfg->floppy_b : NULL);
     io_cmos_sync_floppies();   // ★ 镜像挂完才知容量，此时才能把 CMOS 软驱类型对齐
+    io_cmos_sync_disks();      // ★ 同理：AT 靠 CMOS 0x12 的固定盘类型才认得到硬盘
 
     vga_clear(0x07);
     vga_set_composite(cfg->composite);

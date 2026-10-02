@@ -872,7 +872,9 @@ static void cmos_init(void) {
   cmos_rtc[0x0E] = 0x00;   // 诊断状态：bit7=配置无效 bit6=校验和错 bit5=配置不一致
   // ---- 设备配置（必须和模拟出的硬件吻合，否则 POST 报 162）----
   cmos_rtc[0x10] = 0x44;   // 软盘 A:/B: 都是 1.44MB（类型 4）
-  cmos_rtc[0x12] = 0x02;   // 硬盘 C: 类型 2（615 柱面 × 4 磁头 × 17 扇区 ≈ 20MB）
+  // 固定盘类型：高 4 位 = C: 类型，低 4 位 = D: 类型。类型 2 = 615×4×17 ≈ 20MB
+  // （必须写高半字节 0x20；旧值 0x02 落在低半字节，等于"没有 C:、D: 才是类型 2"）。
+  cmos_rtc[0x12] = 0x20;   // 硬盘 C: 类型 2（615 柱面 × 4 磁头 × 17 扇区 ≈ 20MB）
   cmos_rtc[0x14] = 0x4F;   // 设备字节：有软驱(bit0)、80287 存在(bit1)、软驱 2 台(bits6-7=01)。
                            //   bit1 必须为 1：模拟器的 287 能被 POST 的 fninit/fnstcw 探测到
                            //   （F000:1497 探测成功 → AH=2），若设备字 bit1=0 则不一致 → 报 162。
@@ -948,6 +950,38 @@ void io_cmos_sync_floppies(void) {
   cmos_update_checksum();
   fprintf(stderr, "[CMOS] floppy A:=%u B:=%u -> 0x10=%02X 0x14=%02X (chk=%02X%02X)\n",
           a, b, cmos_rtc[0x10], cmos_rtc[0x14], cmos_rtc[0x2E], cmos_rtc[0x2F]);
+}
+
+// ============================================================
+// 把 CMOS 的固定盘类型与实际挂载的硬盘镜像对齐
+//   AT BIOS 从 CMOS 0x12 取固定盘类型：
+//     高 4 位 = C:（第一块固定盘）类型，低 4 位 = D:（第二块）类型，0 = 没有。
+//   BIOS 据此初始化自己的 INT 13h 硬盘服务，并把驱动器数量写进 BDA 40:75；
+//   DOS / FDISK 正是照 BDA 40:75 来找固定盘的。
+//
+//   ★ 之前完全没有这一步（软盘有 io_cmos_sync_floppies，硬盘没有）：
+//     0x12 一旦被持久化成 0x00（旧会话留下的 cmos.rom，或首次 cmos_init 之后又被
+//     POST/客机写回覆盖），就永远不会自己变回有效类型 —— AT BIOS 取不到类型，
+//     BDA 40:75 保持 0 → FDISK 报「No fixed disks present」。
+//
+//   AT 固定盘类型表（与本模拟器 ide.h 的几何对照）：
+//     类型 1 = 306 柱面 × 4 磁头 × 17 扇区 ≈ 10MB
+//     类型 2 = 615 柱面 × 4 磁头 × 17 扇区 ≈ 20MB  ← IDE_CYLINDERS/HEADS/SPT 正是这个
+//   ★ 必须在 ide_mount_disk() 之后调用（那时 ide_disk.present 才准）。
+// ============================================================
+static uint8_t cmos_fixed_disk_type(void) {
+  if (IDE_CYLINDERS == 306 && IDE_HEADS == 4 && IDE_SPT == 17) return 1;
+  if (IDE_CYLINDERS == 615 && IDE_HEADS == 4 && IDE_SPT == 17) return 2;
+  return 2;   // 其它几何：AT 类型表里找不到对应项，用 2 占位（实际几何以 IDE 仿真为准）
+}
+
+void io_cmos_sync_disks(void) {
+  uint8_t c = ide_disk.present ? cmos_fixed_disk_type() : 0;
+  // 只挂一块固定盘 → 高 4 位写类型，低 4 位保持 0（没有 D:）
+  cmos_rtc[0x12] = (uint8_t)(c << 4);
+  cmos_update_checksum();
+  fprintf(stderr, "[CMOS] fixed disk present=%d type=%u -> 0x12=%02X (chk=%02X%02X)\n",
+          ide_disk.present ? 1 : 0, c, cmos_rtc[0x12], cmos_rtc[0x2E], cmos_rtc[0x2F]);
 }
 
 // ============================================================
@@ -1553,7 +1587,6 @@ void io_reset(void) {
 // ============================================================
 // 初始化 CMOS
 // ============================================================
-__attribute__((constructor))
 // 由 cpu_cycles + CRTC 寄存器推导"当前正在显示的扫描线"（0..199）。
 // 与 0x3DA 状态口的时序算法完全一致，8088 MPH 之类靠逐行改写 0x3D9 把色度相位偏移
 // 来生成伪色（1024 色模式），渲染必须按行取当时的寄存器值，这个函数把"写寄存器那一刻"
@@ -1570,8 +1603,16 @@ int vga_current_scanline(void) {
     return (int)(line % 200);
 }
 
+// ★ 构造属性必须挂在这个函数上（之前误挂在上面的 vga_current_scanline 上，
+//   导致本函数成了死代码：cmos_load / cmos_init / atexit(cmos_save) 全都没执行过，
+//   客机一上电看到的 CMOS 是全 0 —— 其中 0x12 固定盘类型也是 0，硬盘自然不认）。
+__attribute__((constructor))
 static void io_init_constructor(void) {
-  if (!cmos_load()) { cmos_init(); cmos_save(); }
+  bool ok = cmos_load();
+  // 掉电/失效标志：0x0D bit7 = 0 表示"电池没电、RAM 与时间无效"。真机没电就要重配，
+  // 这里同理 —— 旧会话留下的镜像若带这个标志（或干脆读不出），重建一套有效配置，
+  // 否则 POST 会拿 163/162 去卡引导、且固定盘类型仍是垃圾值。
+  if (!ok || !(cmos_rtc[0x0D] & 0x80)) { cmos_init(); cmos_save(); }
   // ★ shutdown byte（0x0F）语义上是"上一次关机/重启的方式"，真机一上电 BIOS 就
   //   立刻把它清成 0（见 F000:00E7 的 out %al,$0x71）。它必须随会话重置：
   //   若持久化了上次的 0x06，下次启动 F000:0050 的跳转表会把 POST 直接送进中段

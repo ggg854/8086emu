@@ -38,5 +38,7 @@ void io_reset(void);
 // 必须在 ide_mount_floppy 之后调用 —— 镜像大小那时才确定；不对齐会让 AT POST
 // 判「配置不一致」→ 报 162。
 void io_cmos_sync_floppies(void);
+// 把 CMOS 0x12 的固定盘类型与实际挂载的硬盘对齐（见 io.c 注释）
+void io_cmos_sync_disks(void);
 
 #endif
