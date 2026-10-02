@@ -44,6 +44,8 @@ void ide_mount_disk(const char* filename);
 // IDE 端口（0x1F0~0x1F7）
 uint8_t  ide_read_port(uint16_t port);
 void     ide_write_port(uint16_t port, uint8_t val);
+// 0x3F6（AT 的 IDE 备用状态口读 / 设备控制口写，与软驱 0x3F0-0x3F5、0x3F7 不冲突）
+void     ide_write_alt(uint8_t val);
 uint16_t ide_read_port16(uint16_t port);
 void     ide_write_port16(uint16_t port, uint16_t val);
 

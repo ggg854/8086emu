@@ -1120,9 +1120,13 @@ uint8_t io_read_port(uint16_t port) {
     // ---- FDC ----
     case 0x3F0: case 0x3F1: case 0x3F2:
     case 0x3F3: case 0x3F4: case 0x3F5:
-    case 0x3F6: case 0x3F7:
+    case 0x3F7:
       ret = fdc_read_port(port);
       break;
+    // ★ AT 上 0x3F6 是 IDE 的"备用状态口"（读它不会清除 pending 的 IRQ14），
+    //   BIOS 在数据传输阶段常用它轮询 DRQ。之前被接到软驱（返回 0），于是
+    //   BIOS 永远等不到就绪 → 发完 READ 后死循环（fdisk 选 1 卡死）。
+    case 0x3F6: ret = ide_read_port(0x1F7); break;
     case 0x241: ret = 0x00; break;
     case 0x341: ret = 0x00; break;
     // ---- VGA ----
@@ -1424,9 +1428,11 @@ void io_write_port(uint16_t port, uint8_t val) {
     // ---- FDC ----
     case 0x3F0: case 0x3F1: case 0x3F2:
     case 0x3F3: case 0x3F4: case 0x3F5:
-    case 0x3F6: case 0x3F7:
+    case 0x3F7:
       fdc_write_port(port, val);
       break;
+    // ★ 0x3F6 写 = IDE 设备控制寄存器（bit1 nIEN=1 时禁止 INTRQ）
+    case 0x3F6: ide_write_alt(val); break;
 
     case 0x3C0:
     if (attr_data_phase) {

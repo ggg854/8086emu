@@ -57,11 +57,24 @@ static void ide_set_error(uint8_t code) {
     ide_trace("ERR", ide_command);
 }
 
+// 设备控制寄存器（0x3F6 写）bit1 = nIEN：1 时禁止 INTRQ
+static bool ide_nien = false;
+
+// 投 IRQ14（被 nIEN 屏蔽时静默丢弃）
+static void ide_raise_irq(void) {
+    if (!ide_nien) ide_irq = true;
+}
+
+// 0x3F6 写：IDE 设备控制寄存器（目前只有 nIEN 有实际意义）
+void ide_write_alt(uint8_t val) {
+    ide_nien = (val & 0x02) != 0;
+}
+
 static void ide_ok(bool irq) {
     ide_error = 0;
     ide_drq = false;
     ide_status = IDE_ST_READY;
-    if (irq) ide_irq = true;
+    if (irq) ide_raise_irq();
 }
 
 // 本次传输扇区数（寄存器值 0 = 256）
@@ -121,6 +134,11 @@ static void ide_start_transfer(bool is_write) {
     }
     ide_drq = true;
     ide_status = IDE_ST_DATA;
+    // ★ ATA 的 PIO 时序：准备好传一个数据块（DRQ 置位）时就会断言 INTRQ，
+    //   由 INT 76h 的中断服务程序来搬数据；搬完最后一块再断言一次表示命令完成
+    //   （见 ide_ok）。之前只在"命令完成"时才投 IRQ，于是中断方式读盘的 BIOS
+    //   发完 READ 就一直等 IRQ14，而数据永远没人来取 → 互相等待死锁。
+    ide_raise_irq();
 }
 
 // IDENTIFY DEVICE（0xEC）响应：256 个字
