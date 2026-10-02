@@ -48,7 +48,7 @@ supports hard disk, floppy, FPU, and 80286 protected mode.
 
 \## Build
 
-
+You'll need to provide the BIOS file yourself
 
 (fill in your build steps, for example:)
 
