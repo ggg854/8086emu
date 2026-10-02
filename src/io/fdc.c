@@ -54,6 +54,13 @@ static int     int_qhead = 0, int_qtail = 0;
 // IRQ6 边沿，等主循环轮询投递
 static bool     irq_line = false;
 
+// ★ 中断锁存（供 SENSE INTERRUPT STATUS 读取，独立于 PIC 应答）
+//   真机：FDC 的 INTRQ 与内部中断锁存独立；CPU 应答 INT 0E（清 PIC IRQ）并不清除
+//   FDC 锁存的状态，只有 SENSE INTERRUPT STATUS 才清。故另设锁存，避免 INT 0E
+//   先被服务后 SENSE INTERRUPT 读到 0x80（无中断）→ BIOS 误判 seek/recal 失败。
+static uint8_t  intr_st0 = 0, intr_pcn = 0;
+static bool     intr_latched = false;
+
 // 每台驱动器当前柱面 + SPECIFY 参数
 static uint8_t  pcn[4] = {0, 0, 0, 0};
 static uint8_t  specify_srt_hut = 0xDF;
@@ -70,6 +77,12 @@ static uint8_t  fdc_perp     = 0;       // PERPENDICULAR MODE
 
 // 最近一次命令涉及的驱动器（MSR 忙标志用）
 static int      cur_drive = 0;
+
+// 磁盘更换锁存（DIR 0x3F7 的 bit7）：真 uPD765 在复位后为 1（迫使 BIOS 先
+// recalibrate），recalibrate/seek 完成（磁头归位）后由硬件自动清 0。模拟器
+// 必须正确建模——否则 BIOS 读引导扇区前看到 bit7=1 会判定"盘被换过"而中止、
+// 根本不发 READ DATA，最终退回 ROM BASIC。盘已挂载（镜像常驻）时该位应为 0。
+static bool     disk_change[4] = { false, false, false, false };
 
 // ============================================================
 // 几何：由该驱动器镜像大小推断
@@ -249,6 +262,15 @@ static void fdc_rw(bool is_write, bool is_track) {
   uint8_t r[7] = { st0, st1, st2, C, (uint8_t)H, lastR, N };
   fdc_result(r, 7);
   fdc_raise_irq(st0, C);
+
+  // 调试：软盘读后 dump 实际 DMA 地址与 0:7C00 内存（仅 -dbg 时）
+  if (debug_mode && !is_write && drive == 0) {
+    fprintf(stderr, "[FDC] FLOPPYREAD addr=%05X st0=%02X st1=%02X xfer=%u "
+            "mem7C00=%02X %02X %02X %02X sig=%02X %02X\n",
+            addr, st0, st1, transferred,
+            memory[0x7C00], memory[0x7C01], memory[0x7C02], memory[0x7C03],
+            memory[0x7DFE], memory[0x7DFF]);
+  }
 
   if (debug_mode) {
     static clock_t last_ck = 0;
@@ -451,6 +473,7 @@ void fdc_reset(void) {
 // ============================================================
 static void fdc_execute(void) {
   phase = PH_IDLE;                           // 默认：命令结束后没有结果相位
+  // 调试：打印 FDC 命令（仅 -dbg 时，便于定位 boot 读与 601）
   if (debug_mode)
     fprintf(stderr, "[FDCCMD] op=%02X n=%d p=%02X %02X %02X %02X pcnA=%u pcnB=%u\n",
             opcode, cmd_len, cmd[1], cmd[2], cmd[3], cmd[4], pcn[0], pcn[1]);
@@ -472,14 +495,21 @@ static void fdc_execute(void) {
       uint8_t hdus = cmd[1];
       int drive = hdus & 0x03;
       cur_drive = drive;
-      // ST3：bit7/6/5/2 恒为 1（uPD765 测试位）；bit4 就绪；bit3 写保护；bit1 磁头；bit0 驱动器
-      uint8_t s = (uint8_t)(0xE4 | (drive & 0x03));
+      // ST3：bit6=T00（在 0 道置 1）；bit2 恒 1；bit4 就绪位恒 1；bit1 磁头；bit0-1 驱动器。
+      // bit7=DSKCHG（磁盘更换）必须反映 disk_change[drive] 真实状态：复位后置位、recal/seek
+      // 完成后清除。若硬编码为 1，BIOS 读处理例程会误判“磁盘已更换”，陷入
+      // recalibrate→SENSE 死循环，永不下发 READ 命令（op=06）→ 引导失败。
+      uint8_t s = (uint8_t)(0x24 | (drive & 0x03));
+      if (pcn[drive] == 0) s |= 0x40;        // T00：当前在 0 道
       if (hdus & 0x04) s |= 0x02;            // HDS → ST3 bit1
-      // 就绪位(bit4)：真实硬件缺失盘时 READY 被上拉为高，故无论有无盘都置 1；
-      // 否则 BIOS 两台盘自检循环会因 B 盘 not-ready 报 601。
-      s |= 0x10;
+      s |= 0x10;                             // 就绪位(bit4) 恒 1（缺失盘 READY 上拉）
+      if (disk_change[drive]) s |= 0x80;     // DSKCHG 反映真实状态
+      else s &= ~0x80;
       // 写保护：可写镜像不报 WP（bit3=0）。如需支持只读镜像此处再加。
       fdc_result(&s, 1);
+      if (debug_mode)
+        printf("[FDC] SENSE-DRIVE d=%d hdus=%02X ST3=%02X dc=%d\n",
+               drive, hdus, s, disk_change[drive]);
       break;
     }
 
@@ -495,11 +525,16 @@ static void fdc_execute(void) {
       int drive = cmd[1] & 0x03;
       cur_drive = drive;
       pcn[drive] = 0;
-      // 缺失盘按“未连接”处理：真实硬件里没接驱动器的 READY 信号被上拉为高，
-      // recalibrate 会正常结束（ST0=0x20，IC=00）而不是报 equipment check(0x60)。
-      // AT POST 软驱自检硬编码测两台盘（0xF2C23 处 di=0,1 循环），若缺失盘返回
-      // 0x60 就被 BIOS 判失败 → 601；返回 0x20 则通过。
-      uint8_t st0 = (uint8_t)(0x20 | drive);
+      fdc_int_clear();   // 丢弃复位阶段未读尽的复位中断，避免插队到 recal 结果前
+      uint8_t st0;
+      if (drive_present(drive)) {
+        // 已连接盘：归位到 0 道，寻道结束（IC=00, SE=1）
+        disk_change[drive] = false;          // recalibrate 完成清磁盘更换锁存
+        st0 = (uint8_t)(0x20 | drive);
+      } else {
+        // 未连接盘：真实 uPD765 返回 equipment check（IC=01, EC=1）
+        st0 = (uint8_t)(0x60 | drive);
+      }
       if (debug_mode)
         printf("[FDC] RECAL drv=%d present=%d -> ST0=%02X\n", drive, drive_present(drive), st0);
       fdc_raise_irq(st0, 0x00);
@@ -508,13 +543,17 @@ static void fdc_execute(void) {
 
     case 0x08: {                             // SENSE INTERRUPT STATUS
       uint8_t r[2];
+      int qcnt = (int_qtail - int_qhead) & 7;
+      if (debug_mode)
+        fprintf(stderr, "[FDC] SENSE-INT qcnt=%d h=%d t=%d\n", qcnt, int_qhead, int_qtail);
       if (fdc_int_pop(&r[0], &r[1])) {
         if (debug_mode)
-          printf("[FDC] SENSE-INT ST0=%02X PCN=%02X\n", r[0], r[1]);
+          fprintf(stderr, "[FDC] SENSE-INT ST0=%02X PCN=%02X\n", r[0], r[1]);
       } else {
         r[0] = 0x80;                         // 无中断挂起 → ST0=0x80（非法命令）
         r[1] = pcn[cur_drive];
-        if (debug_mode) printf("[FDC] SENSE-INT (none) ST0=80\n");
+        if (debug_mode)
+          fprintf(stderr, "[FDC] SENSE-INT (none) ST0=80\n");
       }
       fdc_result(r, 2);
       break;
@@ -587,8 +626,14 @@ static void fdc_execute(void) {
       uint8_t cyl = cmd[2];
       cur_drive = drive;
       pcn[drive] = cyl;
-      // 同 recalibrate：缺失盘按 READY 上拉处理，返回 seek-end 成功(0x20)而非 equipment check
-      uint8_t st0 = (uint8_t)(0x20 | (head << 2) | drive);
+      fdc_int_clear();   // 丢弃复位阶段未读尽的复位中断，避免插队到 seek 结果前
+      uint8_t st0;
+      if (drive_present(drive)) {
+        disk_change[drive] = false;          // seek 完成清磁盘更换锁存
+        st0 = (uint8_t)(0x20 | (head << 2) | drive);
+      } else {
+        st0 = (uint8_t)(0x60 | (head << 2) | drive);
+      }
       if (debug_mode)
         printf("[FDC] SEEK drv=%d head=%d cyl=%u present=%d -> ST0=%02X\n",
                drive, head, cyl, drive_present(drive), st0);
@@ -649,12 +694,15 @@ static void fdc_write_dor(uint8_t val) {
     cmd_pos = 0;
     fdc_int_clear();
     cur_drive = 0;
-    for (int i = 0; i < 4; i++) pcn[i] = 0;
+    for (int i = 0; i < 4; i++) { pcn[i] = 0; }  // 复位：磁头归零；DSKCHG 锁存不置位
+                                  // （真实 uPD765 复位不会断言磁盘更换，只有实际换盘才置位；
+                                  // 若此处置位，BIOS 引导读会在“复位→recal→再复位”间死循环）
     return;
   }
-  // 由复位进入使能：uPD765 复位后会为每台盘(0..3)产生一个"未就绪"中断
-  // (ST0=0xC0|drv)，BIOS 的 int 13h ah=0 reset 会连读 4 次 SENSE INTERRUPT 校验；
-  // 不生成这 4 个中断 → reset 返回 ah!=0 → POST 报 601。
+  // 由复位进入使能：为每台盘(drive 0..3)各产生一个中断，ST0=0xC0|drv（IC=11=未就绪）。
+  // 这是真实 uPD765 复位后的标准行为，也是 AT BIOS int 13h ah=0 复位例程的硬约束
+  // （它循环 4 次 SENSE INTERRUPT STATUS，依次期望 0xC0/0xC1/0xC2/0xC3）。
+  // recalibrate/seek 命令开始时清空未读尽的复位中断，避免插队到结果前导致错位(601)。
   if (!was_enabled) {
     for (int d = 0; d < 4; d++) fdc_raise_irq((uint8_t)(0xC0 | d), 0);
   }
@@ -675,7 +723,7 @@ uint8_t fdc_read_port(uint16_t port) {
     case 0x3F1: return 0x00;                 // SRB
     case 0x3F2: return dor;                  // DOR
     case 0x3F3: return 0x00;
-    case 0x3F4: { uint8_t m = fdc_msr(); if (debug_mode) fprintf(stderr, "[FDCMR] MSR=%02X\n", m); return m; }            // MSR
+    case 0x3F4: { uint8_t m = fdc_msr(); if (debug_mode) fprintf(stderr, "[FDCMR] MSR=%02X phase=%d\n", m, phase); return m; }            // MSR
     case 0x3F5: {                            // 数据寄存器
       if (phase != PH_RESULT || res_pos >= res_len) return 0xFF;
       uint8_t v = res[res_pos++];
@@ -686,7 +734,12 @@ uint8_t fdc_read_port(uint16_t port) {
       return v;
     }
     case 0x3F6: return 0x00;
-    case 0x3F7: return 0x80;                 // DIR：磁盘更换位默认置位（真实硬件复位/换盘后为 1，BIOS 据此先 recalibrate）
+    case 0x3F7: {                          // DIR：bit7=磁盘更换锁存（盘常驻时为 0）
+      uint8_t v = disk_change[dor & 0x03] ? 0x80 : 0x00;
+      if (debug_mode)
+        fprintf(stderr, "[FDCDIR] drive=%d dir=%02X disk_change=%d\n", dor & 0x03, v, disk_change[dor & 0x03]);
+      return v;
+    }
     default:    return 0xFF;
   }
 }

@@ -294,7 +294,9 @@ static gpointer con_reader(gpointer arg) {
         if (c == 0x03 || c == 0x1A) break;   // Ctrl+C / Ctrl+Z
         con_push_byte((uint8_t)c);
     }
-    emu_running = false;   // Ctrl+C 或 stdin 读完（EOF）都退出，否则主循环会一直空转、不落盘
+    // ★ EOF 不再退出模拟器：无头/管道场景 stdin 可能提前关闭（或压根没接终端），
+    //   此时若直接退出，主循环连一条指令都跑不了，无法用于自动化引导测试。
+    //   仅 Ctrl+C(0x03)/Ctrl+Z(0x1A) 主动退出；其余情况停掉读取线程、主循环继续跑。
     return NULL;
 }
 
@@ -543,6 +545,13 @@ static gboolean tick(gpointer data) {
                     cpu.ds, cpu.es, cpu.ss, cpu.cs);
             fprintf(stderr, "  FL=%04X  a20=%d pe=%d\n",
                     cpu.flags, (int)cpu_a20_enabled, (int)protect.pe);
+            // ★ 打印跳转前的指令（last_cs/last_ip 指向上一条已执行指令），定位"谁跳到了 0:0"
+            {
+                uint32_t pa = ((uint32_t)last_cs << 4) | last_ip;
+                fprintf(stderr, "  PREV CS:IP=%04X:%04X bytes:", last_cs, last_ip);
+                for (int k = 0; k < 8; k++) fprintf(stderr, " %02X", cpu_mem_read(pa + k));
+                fprintf(stderr, "\n");
+            }
             cpu_running = false;
             break;   // ★ 跳出 while，不 return
         }
@@ -600,6 +609,15 @@ static gboolean tick(gpointer data) {
         // 等到才认为定时器正常（否则报 101 停机）。
         io_pit_step(cpu_last_cycles);
         cyc_this_frame += cpu_last_cycles;
+        // ★ 心跳：定位 POST 死循环（回跳类循环），HEARTBEAT=1 时每 2M 条指令打印 CS:IP
+        {
+            static int hb_on = -1;
+            static uint64_t hb_cnt = 0;
+            if (hb_on < 0) hb_on = getenv("HEARTBEAT") ? 1 : 0;
+            if (hb_on && ((hb_cnt++ & 0x1FFFFF) == 0))
+                fprintf(stderr, "[HB] CS=%04X IP=%04X AX=%04X CX=%04X DX=%04X\n",
+                        cpu.cs, cpu.ip, cpu.ax, cpu.cx, cpu.dx);
+        }
         if (!cpu_prefix_step) io_timer_poll();
 
         // 软盘中断（IRQ6）：BIOS 等中断的超时窗口只有 ~26ms，

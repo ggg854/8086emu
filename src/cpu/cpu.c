@@ -18,7 +18,7 @@ uint32_t cpu_clk_hz = CPU_CLK_HZ_DEFAULT;
 #define MEM(a) cpu_mem_read((uint32_t)(a))
 CPU_8086 cpu;
 uint8_t* memory = NULL;
-uint32_t memory_size = 0x200000;   // 2MB（见 cpu.h）
+uint32_t memory_size = 0x800000;   // 8MB：1MB 常规 + 7MB 扩展（XMS/HIMEM 用；见 cpu.h）
 bool cpu_running = true;
 static uint16_t seg_override = 0;
 // 段覆盖前缀是否生效。不能用 seg_override==0 判断"没有覆盖"：ES/DS/SS 在早期
@@ -172,7 +172,7 @@ uint16_t cpu_get_seg_ds(void) {
 }
 
 void cpu_init(void) {
-    memory = calloc(memory_size, 1);   // 2MB（见 cpu.h 的 CPU_RAM_INSTALLED）
+    memory = calloc(memory_size, 1);   // 8MB（见 cpu.h 的 CPU_RAM_INSTALLED）
     memset(&memory[0xF0000], 0xFF, 0x10000);
     cpu386_init();
     protect_init();
@@ -682,6 +682,282 @@ static uint32_t insn_cyc(uint8_t op, uint8_t modrm) {
 }
 
 // ============================================================
+// ============================================================
+// 32 位操作数 / 32 位地址支持（386 超集；由 0x66 / 0x67 前缀触发）
+//   设计：仅在保护模式（或显式前缀）下进入 32 位路径；8086/286 实模式
+//   程序从不设置这两个前缀，故对现有 DOS / BIOS 行为零影响。
+// ============================================================
+static uint32_t* reg32_table[] = { &cpu.eax, &cpu.ecx, &cpu.edx, &cpu.ebx, &cpu.esp, &cpu.ebp, &cpu.esi, &cpu.edi };
+
+static inline uint32_t rd32_cs(uint16_t off) {
+    return (uint32_t)read_word(cpu.cs, off) | ((uint32_t)read_word(cpu.cs, (uint16_t)(off + 2)) << 16);
+}
+
+static void push32(uint32_t val) {
+    cpu.esp -= 4;
+    uint32_t a = seg_lin(cpu.ss, cpu.esp, 4, true);
+    cpu_mem_write(a,     val & 0xFF);
+    cpu_mem_write(a + 1, (val >> 8) & 0xFF);
+    cpu_mem_write(a + 2, (val >> 16) & 0xFF);
+    cpu_mem_write(a + 3, (val >> 24) & 0xFF);
+}
+static uint32_t pop32(void) {
+    uint32_t a = seg_lin(cpu.ss, cpu.esp, 4, false);
+    uint32_t v = cpu_mem_read(a) | (cpu_mem_read(a + 1) << 8) | ((uint32_t)cpu_mem_read(a + 2) << 16) | ((uint32_t)cpu_mem_read(a + 3) << 24);
+    cpu.esp += 4;
+    return v;
+}
+
+static void update_arith_flags_32(uint32_t result, uint32_t a, uint32_t b, bool is_sub) {
+    if (is_sub) {
+        if (a < b) set_flag(FLAG_CF); else clear_flag(FLAG_CF);
+        if (((a ^ b) & (a ^ result) & 0x80000000u)) set_flag(FLAG_OF); else clear_flag(FLAG_OF);
+    } else {
+        if (result < a) set_flag(FLAG_CF); else clear_flag(FLAG_CF);
+        if ((~(a ^ b) & (a ^ result) & 0x80000000u)) set_flag(FLAG_OF); else clear_flag(FLAG_OF);
+    }
+    if ((a ^ b ^ result) & 0x10) set_flag(FLAG_AF); else clear_flag(FLAG_AF);
+    if (result == 0) set_flag(FLAG_ZF); else clear_flag(FLAG_ZF);
+    if (result & 0x80000000u) set_flag(FLAG_SF); else clear_flag(FLAG_SF);
+    int c = 0; for (int i = 0; i < 32; i++) if (result & (1u << i)) c++;
+    if (c % 2 == 0) set_flag(FLAG_PF); else clear_flag(FLAG_PF);
+}
+static void update_logic_flags_32(uint32_t result) {
+    if (result == 0) set_flag(FLAG_ZF); else clear_flag(FLAG_ZF);
+    if (result & 0x80000000u) set_flag(FLAG_SF); else clear_flag(FLAG_SF);
+    int c = 0; for (int i = 0; i < 32; i++) if (result & (1u << i)) c++;
+    if (c % 2 == 0) set_flag(FLAG_PF); else clear_flag(FLAG_PF);
+    clear_flag(FLAG_CF); clear_flag(FLAG_OF);
+}
+
+// 32 位 ALU：kind 0=ADD 1=OR 2=ADC 3=SBB 4=AND 5=SUB 6=XOR 7=CMP
+static uint32_t alu32(uint8_t kind, uint32_t a, uint32_t b) {
+    uint64_t full; uint32_t res; bool sub = (kind == 3 || kind == 5 || kind == 7);
+    uint64_t cin = (kind == 2 || kind == 3) ? (get_flag(FLAG_CF) ? 1 : 0) : 0;
+    switch (kind) {
+        case 1: res = a | b; update_logic_flags_32(res); return res;
+        case 4: res = a & b; update_logic_flags_32(res); return res;
+        case 6: res = a ^ b; update_logic_flags_32(res); return res;
+        case 0: case 2: full = (uint64_t)a + b + cin; break;
+        case 3: case 5: case 7: full = (uint64_t)a - b - cin; break;
+        default: full = a; break;
+    }
+    res = (uint32_t)full;
+    if ((full >> 32) & 1) set_flag(FLAG_CF); else clear_flag(FLAG_CF);
+    if (sub) { if (((a ^ b) & (a ^ res) & 0x80000000u)) set_flag(FLAG_OF); else clear_flag(FLAG_OF); }
+    else     { if ((~(a ^ b) & (a ^ res) & 0x80000000u)) set_flag(FLAG_OF); else clear_flag(FLAG_OF); }
+    if ((a ^ b ^ res) & 0x10) set_flag(FLAG_AF); else clear_flag(FLAG_AF);
+    if (res == 0) set_flag(FLAG_ZF); else clear_flag(FLAG_ZF);
+    if (res & 0x80000000u) set_flag(FLAG_SF); else clear_flag(FLAG_SF);
+    int c = 0; for (int i = 0; i < 32; i++) if (res & (1u << i)) c++;
+    if (c % 2 == 0) set_flag(FLAG_PF); else clear_flag(FLAG_PF);
+    return res;
+}
+
+// 32 位移位：kind 0=ROL 1=ROR 2=RCL 3=RCR 4=SHL 5=SHR 6=SAL 7=SAR
+static uint32_t shift32(uint8_t kind, uint32_t v, uint8_t cnt) {
+    if (cnt == 0) return v;
+    uint32_t res = v; bool cf = false;
+    for (int i = 0; i < cnt; i++) {
+        switch (kind) {
+            case 0: cf = (res & 0x80000000u) != 0; res = (res << 1) | (cf ? 1 : 0); break; // ROL
+            case 1: cf = (res & 1) != 0; res = (res >> 1) | (cf ? 0x80000000u : 0); break; // ROR
+            case 2: { bool o = cf; cf = (res & 0x80000000u) != 0; res = (res << 1) | (o ? 1 : 0); } break; // RCL
+            case 3: { bool o = cf; cf = (res & 1) != 0; res = (res >> 1) | (o ? 0x80000000u : 0); } break; // RCR
+            case 4: case 6: cf = (res & 0x80000000u) != 0; res = res << 1; break; // SHL/SAL
+            case 5: cf = (res & 1) != 0; res = res >> 1; break; // SHR
+            case 7: cf = (res & 1) != 0; res = (uint32_t)((int32_t)res >> 1); break; // SAR
+        }
+    }
+    bool of = false;
+    if (cnt == 1) {
+        if (kind == 0 || kind == 2 || kind == 4 || kind == 6) of = ((res & 0x80000000u) != 0) != ((v & 0x80000000u) != 0);
+        else if (kind == 1 || kind == 3) of = (v & 0x80000000u) != 0;
+        else of = ((res & 0x80000000u) != 0) != ((v & 0x80000000u) != 0);
+    }
+    if (cf) set_flag(FLAG_CF); else clear_flag(FLAG_CF);
+    if (of) set_flag(FLAG_OF); else clear_flag(FLAG_OF);
+    if (res == 0) set_flag(FLAG_ZF); else clear_flag(FLAG_ZF);
+    if (res & 0x80000000u) set_flag(FLAG_SF); else clear_flag(FLAG_SF);
+    int c = 0; for (int i = 0; i < 32; i++) if (res & (1u << i)) c++;
+    if (c % 2 == 0) set_flag(FLAG_PF); else clear_flag(FLAG_PF);
+    return res;
+}
+
+// 32 位有效地址解码：返回段内偏移 off（mod==3 时 *is_reg=true，寄存器索引 *reg_idx）；
+// *modrm_len = 从 ip+1 起（modrm + SIB + disp）的字节数；*seg_out = 所用段。
+static uint32_t modrm32_decode(uint8_t modrm, bool is_write, int* reg_idx, bool* is_reg, uint8_t* modrm_len, uint16_t* seg_out) {
+    uint8_t mod = (modrm >> 6) & 3;
+    uint8_t rm = modrm & 7;
+    if (mod == 3) { *is_reg = true; *reg_idx = rm; *modrm_len = 1; if (seg_out) *seg_out = cpu.ds; return 0; }
+    uint16_t seg = cpu.ds; uint32_t off = 0; uint8_t mlen = 1;
+    if (rm == 4) {
+        uint8_t sib = MEM(cpu.ip + 2); mlen = 2;
+        uint8_t scale = (sib >> 6) & 3;
+        uint8_t index = (sib >> 3) & 7;
+        uint8_t base = sib & 7;
+        uint32_t basev = 0; bool have_base = true;
+        if (base == 5) { if (mod == 0) have_base = false; else basev = cpu.ebp; }
+        else basev = *reg32_table[base];
+        uint32_t idxv = (index == 4) ? 0 : *reg32_table[index];
+        off = (have_base ? basev : 0) + (idxv << scale);
+        seg = cpu.ds;
+        if (mod == 0) { if (!have_base) { off += rd32_cs(cpu.ip + 3); mlen = 6; } }
+        else if (mod == 1) { off += (int8_t)MEM(cpu.ip + 3); mlen = 3; }
+        else { off += rd32_cs(cpu.ip + 3); mlen = 6; }
+    } else if (rm == 5) {
+        if (mod == 0) { off = rd32_cs(cpu.ip + 2); mlen = 5; }
+        else { off = cpu.ebp; seg = cpu.ss; if (mod == 1) { off += (int8_t)MEM(cpu.ip + 2); mlen = 2; } else { off += rd32_cs(cpu.ip + 2); mlen = 5; } }
+    } else {
+        static const uint32_t* r[8] = { &cpu.eax, &cpu.ecx, &cpu.edx, &cpu.ebx, &cpu.esp, &cpu.ebp, &cpu.esi, &cpu.edi };
+        off = *r[rm];
+        if (mod == 1) { off += (int8_t)MEM(cpu.ip + 2); mlen = 2; }
+        else if (mod == 2) { off += rd32_cs(cpu.ip + 2); mlen = 5; }
+    }
+    if (seg_override_active) seg = seg_override;
+    *is_reg = false; *modrm_len = mlen; if (seg_out) *seg_out = seg;
+    return off;
+}
+
+static uint32_t read_modrm32(uint8_t modrm, uint8_t* modrm_len) {
+    int ri; bool is_reg; uint16_t seg;
+    uint32_t off = modrm32_decode(modrm, false, &ri, &is_reg, modrm_len, &seg);
+    if (is_reg) return *reg32_table[ri];
+    uint32_t lin = seg_lin(seg, off, 4, false);
+    return cpu_mem_read(lin) | (cpu_mem_read(lin + 1) << 8) | ((uint32_t)cpu_mem_read(lin + 2) << 16) | ((uint32_t)cpu_mem_read(lin + 3) << 24);
+}
+static void write_modrm32(uint8_t modrm, uint32_t val, uint8_t* modrm_len) {
+    int ri; bool is_reg; uint16_t seg;
+    uint32_t off = modrm32_decode(modrm, true, &ri, &is_reg, modrm_len, &seg);
+    if (is_reg) { *reg32_table[ri] = val; return; }
+    uint32_t lin = seg_lin(seg, off, 4, true);
+    cpu_mem_write(lin, val & 0xFF);
+    cpu_mem_write(lin + 1, (val >> 8) & 0xFF);
+    cpu_mem_write(lin + 2, (val >> 16) & 0xFF);
+    cpu_mem_write(lin + 3, (val >> 24) & 0xFF);
+}
+
+// 32 位指令分发器：返回 true 表示已处理；false 表示交给原有 16 位译码。
+static bool cpu386_exec_operand32(uint8_t op) {
+    // 通用 ALU：宽度可变 r/m,r (op&7==1) / r,r/m (op&7==3) / eAX,imm (op&7==5)
+    uint8_t lo = op & 7;
+    if ((op & 0xC0) == 0x00 && (lo == 1 || lo == 3 || lo == 5)) {
+        uint8_t kind = (op >> 3) & 7;
+        uint8_t m = MEM(cpu.ip + 1); uint8_t regf = (m >> 3) & 7; uint8_t mlen;
+        if (lo == 1) {
+            uint32_t d = read_modrm32(m, &mlen); uint32_t r = *reg32_table[regf];
+            uint32_t res = alu32(kind, d, r); if (kind != 7) write_modrm32(m, res, &mlen);
+            cpu.ip += 1 + mlen; return true;
+        } else if (lo == 3) {
+            uint32_t s = read_modrm32(m, &mlen); uint32_t r = *reg32_table[regf];
+            uint32_t res = alu32(kind, r, s); *reg32_table[regf] = res;
+            cpu.ip += 1 + mlen; return true;
+        } else {
+            uint32_t imm = rd32_cs(cpu.ip + 1); uint32_t res = alu32(kind, cpu.eax, imm);
+            cpu.eax = res; cpu.ip += 5; return true;
+        }
+    }
+    switch (op) {
+        case 0x81: case 0x83: {
+            uint8_t m = MEM(cpu.ip + 1); uint8_t kind = (m >> 3) & 7; uint8_t mlen;
+            uint32_t d = read_modrm32(m, &mlen);
+            uint32_t imm = (op == 0x81) ? rd32_cs(cpu.ip + 1 + mlen) : (uint32_t)(int32_t)(int8_t)MEM(cpu.ip + 1 + mlen);
+            uint32_t res = alu32(kind, d, imm);
+            if (kind != 7) write_modrm32(m, res, &mlen);
+            cpu.ip += 1 + mlen + (op == 0x81 ? 4 : 1); return true;
+        }
+        case 0x85: { uint8_t m = MEM(cpu.ip + 1); uint8_t regf = (m >> 3) & 7; uint8_t mlen; uint32_t d = read_modrm32(m, &mlen); update_logic_flags_32(d & *reg32_table[regf]); cpu.ip += 1 + mlen; return true; }
+        case 0xA9: { uint32_t imm = rd32_cs(cpu.ip + 1); update_logic_flags_32(cpu.eax & imm); cpu.ip += 5; return true; }
+        case 0xF7: {
+            uint8_t m = MEM(cpu.ip + 1); uint8_t sub = (m >> 3) & 7; uint8_t mlen; uint32_t v = read_modrm32(m, &mlen);
+            if (sub == 0) { uint32_t imm = rd32_cs(cpu.ip + 1 + mlen); update_logic_flags_32(v & imm); cpu.ip += 1 + mlen + 4; return true; }
+            else if (sub == 1) { write_modrm32(m, ~v, &mlen); cpu.ip += 1 + mlen; return true; }
+            else if (sub == 2) {
+                uint32_t res = (uint32_t)(0 - v);
+                if (v == 0) clear_flag(FLAG_CF); else set_flag(FLAG_CF);
+                if (v == 0x80000000u) set_flag(FLAG_OF); else clear_flag(FLAG_OF);
+                if ((0 ^ v ^ res) & 0x10) set_flag(FLAG_AF); else clear_flag(FLAG_AF);
+                if (res == 0) set_flag(FLAG_ZF); else clear_flag(FLAG_ZF);
+                if (res & 0x80000000u) set_flag(FLAG_SF); else clear_flag(FLAG_SF);
+                int c = 0; for (int i = 0; i < 32; i++) if (res & (1u << i)) c++; if (c % 2 == 0) set_flag(FLAG_PF); else clear_flag(FLAG_PF);
+                write_modrm32(m, res, &mlen); cpu.ip += 1 + mlen; return true;
+            }
+            else if (sub == 3) { uint64_t r = (uint64_t)v * cpu.eax; cpu.eax = (uint32_t)r; cpu.edx = (uint32_t)(r >> 32); bool cf = (cpu.edx != 0); if (cf) { set_flag(FLAG_CF); set_flag(FLAG_OF); } else { clear_flag(FLAG_CF); clear_flag(FLAG_OF); } cpu.ip += 1 + mlen; return true; }
+            else if (sub == 4) { int64_t r = (int64_t)(int32_t)v * (int64_t)(int32_t)cpu.eax; cpu.eax = (uint32_t)r; cpu.edx = (uint32_t)(r >> 32); bool cf = (r != (int64_t)(int32_t)r); if (cf) { set_flag(FLAG_CF); set_flag(FLAG_OF); } else { clear_flag(FLAG_CF); clear_flag(FLAG_OF); } cpu.ip += 1 + mlen; return true; }
+            else if (sub == 5) { if (v == 0) { cpu_exception(0, "DIV 除零"); return true; } uint64_t dvd = ((uint64_t)cpu.edx << 32) | cpu.eax; uint32_t q = (uint32_t)(dvd / v); if (q > 0xFFFFFFFFu) { cpu_exception(0, "DIV 溢出"); return true; } cpu.eax = q; cpu.edx = (uint32_t)(dvd % v); cpu.ip += 1 + mlen; return true; }
+            else if (sub == 6) { if (v == 0) { cpu_exception(0, "IDIV 除零"); return true; } int64_t dvd = ((uint64_t)cpu.edx << 32) | cpu.eax; int32_t q = (int32_t)(dvd / (int32_t)v); if (q != (int32_t)(uint32_t)q) { cpu_exception(0, "IDIV 溢出"); return true; } cpu.eax = (uint32_t)q; cpu.edx = (uint32_t)(dvd % (int32_t)v); cpu.ip += 1 + mlen; return true; }
+            return false;
+        }
+        case 0xC1: case 0xD1: case 0xD3: {
+            uint8_t m = MEM(cpu.ip + 1); uint8_t kind = (m >> 3) & 7; uint8_t mlen; uint32_t v = read_modrm32(m, &mlen);
+            uint8_t cnt; if (op == 0xC1) cnt = MEM(cpu.ip + 1 + mlen); else if (op == 0xD1) cnt = 1; else cnt = cpu.cx & 0x1F;
+            uint32_t res = shift32(kind, v, cnt); write_modrm32(m, res, &mlen);
+            cpu.ip += 1 + mlen + (op == 0xC1 ? 1 : 0); return true;
+        }
+        case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: {
+            uint32_t old = *reg32_table[op & 7]; uint32_t res = old + 1; bool cf = get_flag(FLAG_CF);
+            update_arith_flags_32(res, old, 1, false); if (cf) set_flag(FLAG_CF); else clear_flag(FLAG_CF);
+            *reg32_table[op & 7] = res; cpu.ip += 1; return true;
+        }
+        case 0x48: case 0x49: case 0x4A: case 0x4B: case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
+            uint32_t old = *reg32_table[op & 7]; uint32_t res = old - 1; bool cf = get_flag(FLAG_CF);
+            update_arith_flags_32(res, old, 1, true); if (cf) set_flag(FLAG_CF); else clear_flag(FLAG_CF);
+            *reg32_table[op & 7] = res; cpu.ip += 1; return true;
+        }
+        case 0xFF: {
+            uint8_t m = MEM(cpu.ip + 1); uint8_t sub = (m >> 3) & 7; uint8_t mlen;
+            if (sub == 0) { uint32_t v = read_modrm32(m, &mlen); write_modrm32(m, v + 1, &mlen); cpu.ip += 1 + mlen; return true; }
+            if (sub == 1) { uint32_t v = read_modrm32(m, &mlen); write_modrm32(m, v - 1, &mlen); cpu.ip += 1 + mlen; return true; }
+            if (sub == 2) { uint32_t t = read_modrm32(m, &mlen); uint32_t ret = cpu.eip + 1 + mlen; push32(ret); cpu.eip = t; cpu.ip += 1 + mlen; return true; }
+            if (sub == 4) { uint32_t t = read_modrm32(m, &mlen); cpu.eip = t; cpu.ip += 1 + mlen; return true; }
+            if (sub == 6) { uint32_t v = read_modrm32(m, &mlen); push32(v); cpu.ip += 1 + mlen; return true; }
+            return false;
+        }
+        case 0x54: { uint32_t ne = cpu.esp - 4; push32(ne); cpu.ip += 1; return true; }
+        case 0x50: case 0x51: case 0x52: case 0x53: case 0x55: case 0x56: case 0x57: { push32(*reg32_table[op & 7]); cpu.ip += 1; return true; }
+        case 0x58: case 0x59: case 0x5A: case 0x5B: case 0x5C: case 0x5D: case 0x5E: case 0x5F: { *reg32_table[op & 7] = pop32(); cpu.ip += 1; return true; }
+        case 0x68: { push32(rd32_cs(cpu.ip + 1)); cpu.ip += 5; return true; }
+        case 0x6A: { push32((uint32_t)(int32_t)(int8_t)MEM(cpu.ip + 1)); cpu.ip += 2; return true; }
+        case 0x60: { uint32_t tmp = cpu.esp; push32(cpu.eax); push32(cpu.ecx); push32(cpu.edx); push32(cpu.ebx); push32(tmp); push32(cpu.ebp); push32(cpu.esi); push32(cpu.edi); cpu.ip += 1; return true; }
+        case 0x61: { uint32_t di = pop32(), si = pop32(), bp = pop32(); pop32(); uint32_t bx = pop32(), dx = pop32(), cx = pop32(), ax = pop32(); cpu.edi = di; cpu.esi = si; cpu.ebp = bp; cpu.ebx = bx; cpu.edx = dx; cpu.ecx = cx; cpu.eax = ax; cpu.ip += 1; return true; }
+        case 0x9C: { push32(cpu.eflags & 0x00FCFFFFu); cpu.ip += 1; return true; }
+        case 0x9D: { uint32_t v = pop32(); cpu.eflags = (cpu.eflags & ~0x00FCFFFFu) | (v & 0x00FCFFFFu); cpu.ip += 1; return true; }
+        case 0x8F: { uint8_t m = MEM(cpu.ip + 1); uint8_t sub = (m >> 3) & 7; uint8_t mlen; if (sub == 0) { uint32_t v = pop32(); write_modrm32(m, v, &mlen); cpu.ip += 1 + mlen; return true; } return false; }
+        case 0xB8: case 0xB9: case 0xBA: case 0xBB: case 0xBC: case 0xBD: case 0xBE: case 0xBF: { *reg32_table[op & 7] = rd32_cs(cpu.ip + 1); cpu.ip += 5; return true; }
+        case 0x89: { uint8_t m = MEM(cpu.ip + 1); uint8_t regf = (m >> 3) & 7; uint8_t mlen; uint32_t s = *reg32_table[regf]; write_modrm32(m, s, &mlen); cpu.ip += 1 + mlen; return true; }
+        case 0x8B: { uint8_t m = MEM(cpu.ip + 1); uint8_t regf = (m >> 3) & 7; uint8_t mlen; uint32_t v = read_modrm32(m, &mlen); *reg32_table[regf] = v; cpu.ip += 1 + mlen; return true; }
+        case 0x8D: { uint8_t m = MEM(cpu.ip + 1); uint8_t regf = (m >> 3) & 7; uint8_t mlen; int ri; bool is_reg; uint16_t seg; uint32_t off = modrm32_decode(m, false, &ri, &is_reg, &mlen, &seg); if (is_reg) return false; *reg32_table[regf] = off; cpu.ip += 1 + mlen; return true; }
+        case 0xC7: { uint8_t m = MEM(cpu.ip + 1); uint8_t mlen; int ri; bool is_reg; uint16_t seg; uint32_t off = modrm32_decode(m, false, &ri, &is_reg, &mlen, &seg); uint32_t imm = rd32_cs(cpu.ip + 1 + mlen); if (is_reg) *reg32_table[ri] = imm; else { uint32_t lin = seg_lin(seg, off, 4, true); cpu_mem_write(lin, imm & 0xFF); cpu_mem_write(lin + 1, (imm >> 8) & 0xFF); cpu_mem_write(lin + 2, (imm >> 16) & 0xFF); cpu_mem_write(lin + 3, (imm >> 24) & 0xFF); } cpu.ip += 1 + mlen + 4; return true; }
+        case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: { uint32_t* r = reg32_table[op & 7]; uint32_t t = cpu.eax; cpu.eax = *r; *r = t; cpu.ip += 1; return true; }
+        case 0x98: { cpu.eax = (uint32_t)(int32_t)(int16_t)cpu.ax; cpu.ip += 1; return true; }
+        case 0x99: { cpu.edx = (cpu.eax & 0x80000000u) ? 0xFFFFFFFFu : 0; cpu.ip += 1; return true; }
+        case 0x69: { uint8_t m = MEM(cpu.ip + 1); uint8_t regf = (m >> 3) & 7; uint8_t mlen; uint32_t s = read_modrm32(m, &mlen); int32_t imm = (int32_t)rd32_cs(cpu.ip + 1 + mlen); int64_t full = (int64_t)(int32_t)s * (int64_t)imm; int32_t res = (int32_t)full; bool cf = (full != (int64_t)res); *reg32_table[regf] = (uint32_t)res; if (cf) { set_flag(FLAG_CF); set_flag(FLAG_OF); } else { clear_flag(FLAG_CF); clear_flag(FLAG_OF); } cpu.ip += 1 + mlen + 4; return true; }
+        case 0x6B: { uint8_t m = MEM(cpu.ip + 1); uint8_t regf = (m >> 3) & 7; uint8_t mlen; uint32_t s = read_modrm32(m, &mlen); int8_t imm8 = (int8_t)MEM(cpu.ip + 1 + mlen); int64_t full = (int64_t)(int32_t)s * (int64_t)imm8; int32_t res = (int32_t)full; bool cf = (full != (int64_t)res); *reg32_table[regf] = (uint32_t)res; if (cf) { set_flag(FLAG_CF); set_flag(FLAG_OF); } else { clear_flag(FLAG_CF); clear_flag(FLAG_OF); } cpu.ip += 1 + mlen + 1; return true; }
+        case 0xE8: { int32_t rel = (int32_t)rd32_cs(cpu.ip + 1); uint32_t ret = cpu.eip + 5; push32(ret); cpu.eip = cpu.eip + 5 + (uint32_t)rel; cpu.ip += 5; return true; }
+        case 0xE9: { int32_t rel = (int32_t)rd32_cs(cpu.ip + 1); cpu.eip = cpu.eip + 5 + (uint32_t)rel; cpu.ip += 5; return true; }
+        case 0xC2: { uint32_t ret = pop32(); cpu.esp += read_word(cpu.cs, cpu.ip + 1); cpu.eip = ret; cpu.ip += 3; return true; }
+        case 0xC3: { uint32_t ret = pop32(); cpu.eip = ret; cpu.ip += 1; return true; }
+        case 0xEA: { uint32_t ne = rd32_cs(cpu.ip + 1); uint16_t ncs = read_word(cpu.cs, cpu.ip + 5); if (protect.pe) protect_far_jmp(ncs, (uint16_t)ne); else { cpu.cs = ncs; cpu.eip = ne; } cpu.ip += 7; return true; }
+        case 0x9A: { uint32_t ne = rd32_cs(cpu.ip + 1); uint16_t ncs = read_word(cpu.cs, cpu.ip + 5); if (protect.pe) protect_far_call(ncs, (uint16_t)ne); else { cpu.sp -= 2; write_word(cpu.ss, cpu.sp, cpu.cs); push32(cpu.eip + 7); cpu.cs = ncs; cpu.eip = ne; } cpu.ip += 7; return true; }
+        case 0xA4: { uint8_t v = cpu_mem_read(seg_lin(cpu.ds, cpu.esi, 1, false)); cpu_mem_write(seg_lin(cpu.es, cpu.edi, 1, true), v); if (get_flag(FLAG_DF)) { cpu.esi--; cpu.edi--; } else { cpu.esi++; cpu.edi++; } cpu.ip += 1; return true; }
+        case 0xA5: { int sz = cpu.prefix_66 ? 4 : 2; uint32_t sa = seg_lin(cpu.ds, cpu.esi, sz, false); uint32_t da = seg_lin(cpu.es, cpu.edi, sz, true); uint32_t v = 0; for (int i = 0; i < sz; i++) v |= (uint32_t)cpu_mem_read(sa + i) << (8 * i); for (int i = 0; i < sz; i++) cpu_mem_write(da + i, (v >> (8 * i)) & 0xFF); if (get_flag(FLAG_DF)) { cpu.esi -= sz; cpu.edi -= sz; } else { cpu.esi += sz; cpu.edi += sz; } cpu.ip += 1; return true; }
+        case 0xA6: { uint8_t a = cpu_mem_read(seg_lin(cpu.ds, cpu.esi, 1, false)); uint8_t b = cpu_mem_read(seg_lin(cpu.es, cpu.edi, 1, false)); uint8_t res = a - b; update_arith_flags_8(res, a, b, true); if (get_flag(FLAG_DF)) { cpu.esi--; cpu.edi--; } else { cpu.esi++; cpu.edi++; } cpu.ip += 1; return true; }
+        case 0xA7: { int sz = cpu.prefix_66 ? 4 : 2; uint32_t sa = seg_lin(cpu.ds, cpu.esi, sz, false); uint32_t da = seg_lin(cpu.es, cpu.edi, sz, false); uint32_t a = 0, b = 0; for (int i = 0; i < sz; i++) { a |= (uint32_t)cpu_mem_read(sa + i) << (8 * i); b |= (uint32_t)cpu_mem_read(da + i) << (8 * i); } uint32_t res = a - b; if (sz == 4) update_arith_flags_32(res, a, b, true); else update_arith_flags(res, a, b, true); if (get_flag(FLAG_DF)) { cpu.esi -= sz; cpu.edi -= sz; } else { cpu.esi += sz; cpu.edi += sz; } cpu.ip += 1; return true; }
+        case 0xAA: { uint8_t v = cpu.al; cpu_mem_write(seg_lin(cpu.es, cpu.edi, 1, true), v); if (get_flag(FLAG_DF)) cpu.edi--; else cpu.edi++; cpu.ip += 1; return true; }
+        case 0xAB: { int sz = cpu.prefix_66 ? 4 : 2; uint32_t da = seg_lin(cpu.es, cpu.edi, sz, true); uint32_t v = cpu.eax; for (int i = 0; i < sz; i++) cpu_mem_write(da + i, (v >> (8 * i)) & 0xFF); if (get_flag(FLAG_DF)) cpu.edi -= sz; else cpu.edi += sz; cpu.ip += 1; return true; }
+        case 0xAC: { uint8_t v = cpu_mem_read(seg_lin(get_seg(), cpu.esi, 1, false)); cpu.al = v; if (get_flag(FLAG_DF)) cpu.esi--; else cpu.esi++; cpu.ip += 1; return true; }
+        case 0xAD: { int sz = cpu.prefix_66 ? 4 : 2; uint32_t sa = seg_lin(get_seg(), cpu.esi, sz, false); uint32_t v = 0; for (int i = 0; i < sz; i++) v |= (uint32_t)cpu_mem_read(sa + i) << (8 * i); cpu.eax = v; if (get_flag(FLAG_DF)) cpu.esi -= sz; else cpu.esi += sz; cpu.ip += 1; return true; }
+        case 0xAE: { uint8_t a = cpu.al; uint8_t b = cpu_mem_read(seg_lin(cpu.es, cpu.edi, 1, false)); uint8_t res = a - b; update_arith_flags_8(res, a, b, true); if (get_flag(FLAG_DF)) cpu.edi--; else cpu.edi++; cpu.ip += 1; return true; }
+        case 0xAF: { int sz = cpu.prefix_66 ? 4 : 2; uint32_t a = cpu.eax; uint32_t da = seg_lin(cpu.es, cpu.edi, sz, false); uint32_t b = 0; for (int i = 0; i < sz; i++) b |= (uint32_t)cpu_mem_read(da + i) << (8 * i); uint32_t res = a - b; if (sz == 4) update_arith_flags_32(res, a, b, true); else update_arith_flags(res, a, b, true); if (get_flag(FLAG_DF)) cpu.edi -= sz; else cpu.edi += sz; cpu.ip += 1; return true; }
+        case 0x6C: { uint8_t v = io_read_port(cpu.dx); cpu_mem_write(seg_lin(cpu.es, cpu.edi, 1, true), v); if (get_flag(FLAG_DF)) cpu.edi--; else cpu.edi++; cpu.ip += 1; return true; }
+        case 0x6D: { int sz = cpu.prefix_66 ? 4 : 2; uint32_t da = seg_lin(cpu.es, cpu.edi, sz, true); uint32_t v = io_read_port16(cpu.dx); for (int i = 0; i < sz; i++) cpu_mem_write(da + i, (v >> (8 * i)) & 0xFF); if (get_flag(FLAG_DF)) cpu.edi -= sz; else cpu.edi += sz; cpu.ip += 1; return true; }
+        case 0x6E: { uint8_t v = cpu_mem_read(seg_lin(get_seg(), cpu.esi, 1, false)); io_write_port(cpu.dx, v); if (get_flag(FLAG_DF)) cpu.esi--; else cpu.esi++; cpu.ip += 1; return true; }
+        case 0x6F: { int sz = cpu.prefix_66 ? 4 : 2; uint32_t sa = seg_lin(get_seg(), cpu.esi, sz, false); uint32_t v = 0; for (int i = 0; i < sz; i++) v |= (uint32_t)cpu_mem_read(sa + i) << (8 * i); io_write_port16(cpu.dx, v); if (get_flag(FLAG_DF)) cpu.esi -= sz; else cpu.esi += sz; cpu.ip += 1; return true; }
+        default: return false;
+    }
+    return false;
+}
+
 // 主译码循环
 // ============================================================
 void cpu_execute_instruction(void) {
@@ -720,25 +996,30 @@ void cpu_execute_instruction(void) {
 
     // REP/REPE/REPNE 前缀
     if (opcode == 0xF2 || opcode == 0xF3) {
-        uint8_t next = MEM(addr + 1);
-        bool rep_ov = false;          // REP 与字符串指令之间是否夹了段覆盖前缀
+        int p = 1;                       // F2/F3 之后的字节偏移
+        bool rep_ov = false;            // REP 与字符串指令之间是否夹了段覆盖前缀
+        bool rep_66 = false, rep_67 = false;  // 操作数/地址宽度前缀（386 超集）
         uint16_t rep_ov_seg = 0;
 
-        // 允许 REP 与字符串指令之间夹一个段覆盖前缀（如 F3 2E A4）
-        if (next == 0x26 || next == 0x2E || next == 0x36 || next == 0x3E) {
-            rep_ov_seg = (next == 0x26) ? cpu.es :
-                         (next == 0x2E) ? cpu.cs :
-                         (next == 0x36) ? cpu.ss : cpu.ds;
-            rep_ov = true;
-            next = MEM(addr + 2);
+        // 收集 F2/F3 之后连续的操作数宽度(0x66)/地址宽度(0x67)/段覆盖前缀，
+        // 支持任意顺序（如 F3 66 A5、F3 2E A5、F3 66 2E A5），并确定真正的字符串操作码。
+        while (true) {
+            uint8_t b = MEM(addr + p);
+            if (b == 0x66) { rep_66 = true; p++; continue; }
+            if (b == 0x67) { rep_67 = true; p++; continue; }
+            if (b == 0x26) { rep_ov_seg = cpu.es; rep_ov = true; p++; continue; }
+            if (b == 0x2E) { rep_ov_seg = cpu.cs; rep_ov = true; p++; continue; }
+            if (b == 0x36) { rep_ov_seg = cpu.ss; rep_ov = true; p++; continue; }
+            if (b == 0x3E) { rep_ov_seg = cpu.ds; rep_ov = true; p++; continue; }
+            break;
         }
+        uint8_t next = MEM(addr + p);
 
         if (next == 0xA4 || next == 0xA5 || next == 0xA6 || next == 0xA7 ||
             next == 0xAA || next == 0xAB || next == 0xAC || next == 0xAD ||
             next == 0xAE || next == 0xAF) {
 
-            cpu.ip++;                       // 跳过 F2/F3 前缀
-            if (rep_ov) cpu.ip++;           // 跳过夹在中间的段前缀
+            cpu.ip += p;                   // 跳过 F2/F3 及其后的所有前缀
             uint32_t base_ip = cpu.ip;      // 指向字符串指令
 
             // 若 REP 之前已有段覆盖（如 2E F3 A4），保留它供每轮使用
@@ -751,12 +1032,17 @@ void cpu_execute_instruction(void) {
                 // CX=0：REP 不执行任何数据搬运，只把 IP 推到指令之后
                 cpu.ip = base_ip + 1;
                 seg_override_active = false;   // ★ 前缀到此为止，不许留给下一条指令
+                cpu.prefix_66 = false;
+                cpu.prefix_67 = false;
                 return;
             }
 
             while (cpu.cx != 0) {
-                // 字符串指令会经 get_seg() 一次性消费掉段覆盖，这里每轮恢复
+                // 字符串指令会经 get_seg() 一次性消费掉段覆盖，这里每轮恢复；
+                // 0x66/0x67 宽度前缀也每条重新挂上，使 32 位字符串（rep movsd 等）正确执行。
                 if (rep_ov) { seg_override = rep_ov_seg; seg_override_active = true; }
+                cpu.prefix_66 = rep_66;
+                cpu.prefix_67 = rep_67;
                 cpu.ip = base_ip;
                 cpu_execute_instruction();
                 cpu.cx--;
@@ -775,6 +1061,16 @@ void cpu_execute_instruction(void) {
         cpu_prefix_step = true;   // 孤立的 REP 前缀：下一步才是真正要执行的指令
         cpu.ip++;
         return;
+    }
+
+    // 32 位操作数 / 地址宽度（0x66 / 0x67）：交给统一分发器处理。
+    //   对现有 8086/286 实模式程序零影响——它们从不设置这两个前缀。
+    if (cpu.prefix_66 || cpu.prefix_67) {
+        if (cpu386_exec_operand32(opcode)) {
+            cpu.prefix_66 = false;
+            cpu.prefix_67 = false;
+            return;
+        }
     }
 
     switch (opcode) {
@@ -2515,6 +2811,11 @@ case 0xC6: {
     seg_override = 0;
     seg_override_active = false;
 
+    // 操作数 / 地址宽度前缀（0x66 / 0x67）同样只对一条指令有效。
+    // 之前只记录不清除，导致此后所有指令被误当 32 位（现已修正）。
+    cpu.prefix_66 = false;
+    cpu.prefix_67 = false;
+
     // 数据访问越限/越权已投递 #GP(13)：译码随后推进的 cpu.ip 会覆盖处理程序入口，
     // 这里恢复成异常处理程序的 CS:IP（见 seg_access_check 的说明）。
     bool faulted = seg_fault_abort;
@@ -2649,8 +2950,64 @@ void cpu_invalid_opcode(uint8_t op) {
 
 void cpu_interrupt(uint8_t int_num) {
 	cpu_halted = false;
-	if (int_num == 0x19)
-		fprintf(stderr, "[INT19] int 19h triggered CS:IP=%04X:%04X\n", cpu.cs, cpu.ip);
+	if (int_num == 0x19) {
+		uint16_t v19 = read_word(0, 0x64);
+		uint16_t s19 = read_word(0, 0x66);
+		fprintf(stderr, "[INT19] triggered EAX=%04X EBX=%04X ECX=%04X EDX=%04X ESI=%04X EDI=%04X EBP=%04X ESP=%04X EIP=%04X CS=%04X DS=%04X ES=%04X SS=%04X FS=%04X GS=%04X EFLAGS=%04X\n  int19 vector=%04X:%04X\n",
+		        cpu.eax, cpu.ebx, cpu.ecx, cpu.edx, cpu.esi, cpu.edi, cpu.ebp, cpu.esp,
+		        cpu.eip, cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs, cpu.eflags, s19, v19);
+	}
+	if (int_num == 0x18)
+		fprintf(stderr, "[INT18] no-boot-device -> %04X:%04X (caller CS:IP=%04X:%04X)\n",
+		        read_word(0, 0x62), read_word(0, 0x60), cpu.cs, cpu.ip);
+	// XMS/HIMEM 底层：INT 15h AH=88h 返回扩展内存大小（KB，>1MB 部分）。
+	//   AT BIOS 本应处理；此兜底保证即使 BIOS 自检没报扩展内存，HIMEM.SYS 仍能
+	//   拿到正确容量（XMS 驱动本身由客机 DOS 的 HIMEM.SYS 提供，无需模拟器内置）。
+	if (int_num == 0x15 && cpu.ah == 0x88) {
+		uint32_t ext_kb = (memory_size > 0x100000) ? (memory_size - 0x100000) / 1024u : 0;
+		cpu.ax = (uint16_t)ext_kb;
+		cpu.flags &= ~1u;            // CF=0 成功
+		return;
+	}
+	if (int_num == 0x13) {
+		// ★ 诊断绕过：软盘读(ah=02, dl=0)直接拷镜像扇区并成功返回，
+		//   用于隔离"FDC READ 命令之后"的路径（确认引导扇区 + jmp 0:7C00 + 执行本身无误）。
+		// ★ 诊断绕过：软盘读(ah=02, dl=0)直接拷镜像扇区并成功返回，仅 FDC_BYPASS=1 时生效。
+		//   用于隔离"FDC READ 命令之后"的路径（确认引导扇区 + jmp 0:7C00 + 执行本身无误）。
+		if (cpu.ah == 0x02 && cpu.dl == 0 && getenv("FDC_BYPASS")) {
+			extern uint8_t* floppy_get_data(int);
+			extern uint32_t floppy_get_size(int);
+			uint8_t* img = floppy_get_data(0);
+			uint32_t  size = floppy_get_size(0);
+			uint8_t cyl = cpu.ch, head = cpu.dh, sec = (uint8_t)(cpu.cl & 0x3F);
+			uint8_t n = cpu.al ? cpu.al : 1;
+			uint32_t spt = 9, heads = 2;            // 360K：9 扇区/道，2 头
+			uint32_t lba = ((uint32_t)cyl * heads + head) * spt + (sec - 1);
+			uint32_t dst = ((uint32_t)cpu.es << 4) | (cpu.ebx & 0xFFFF);
+			for (uint8_t i = 0; i < n && img; i++) {
+				uint32_t off = (lba + i) * 512;
+				if (off + 512 <= size)
+					for (int j = 0; j < 512; j++) cpu_mem_write(dst + i * 512 + j, img[off + j]);
+			}
+			cpu.ah = 0;
+			cpu.flags &= ~1u;                     // CF=0（成功）
+			fprintf(stderr, "[BYPASS] floppy read cyl=%u head=%u sec=%u n=%u -> %05X ok\n",
+			        cyl, head, sec, n, dst);
+			return;
+		}
+		if (debug_mode) {
+			uint16_t v13 = read_word(0, 0x4C), s13 = read_word(0, 0x4E);
+			uint16_t v0e = read_word(0, 0x38), s0e = read_word(0, 0x3A);
+			fprintf(stderr, "[INT13] ah=%02X al=%02X dl=%02X ch=%02X cl=%02X dh=%02X es:bx=%04X:%04X vec13=%04X:%04X int0E=%04X:%04X\n",
+			        cpu.ah, cpu.al, cpu.dl, cpu.ch, cpu.cl, cpu.dh, cpu.es, (uint16_t)(cpu.ebx & 0xFFFF), s13, v13, s0e, v0e);
+			// 桩 floppy 远跳目标（C800:0009..000C）—— 验证是否被 AT BIOS 写 C800 段覆盖
+			{
+				uint16_t t_off = read_word(0, (0xC800u << 4) + 0x0009);
+				uint16_t t_seg = read_word(0, (0xC800u << 4) + 0x000B);
+				fprintf(stderr, "[INT13] stub->floppy target=%04X:%04X\n", t_seg, t_off);
+			}
+		}
+	}
 	// ★ 时序：硬件/软中断本身约 51 周期（压栈 + 查向量表 + 跳转），
 	//   不记的话中断密集时虚拟时间会偏慢
 	cpu_last_cycles = 51;

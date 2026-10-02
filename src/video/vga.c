@@ -924,11 +924,17 @@ bool vga_render(void) {
             comp_prepare();
             static uint8_t  idx[640];
             static uint32_t line[640];
+            // 模式 6（640x200 2 色）前景恒为白(15)，背景 = 0x3D9 位 0-3。
+            // 8088MPH 通过改变背景色寄存器把色度相位偏移，生成复合伪色（1024 色），
+            // 故背景必须用真实调色板色（带 chroma），不能用硬编码的 0（黑），否则
+            // 伪色相位恒定、整幅画面颜色错乱。
+            uint8_t bg6 = cga_color_reg & 0x0F;
+            uint8_t fg6 = 0x0F;
             for (int y = 0; y < 200; y++) {
                 int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
                 const uint8_t* src = &memory[base];
                 for (int x = 0; x < 640; x++)
-                    idx[x] = (src[x >> 3] & (0x80 >> (x & 7))) ? 15 : 0;
+                    idx[x] = (src[x >> 3] & (0x80 >> (x & 7))) ? fg6 : bg6;
                 for (int x = 0; x < 640; x++) line[x] = comp_px(idx, 640, 1, x);
                 int dy = y * 2;
                 memcpy(&px[dy * W], line, 640 * 4);

@@ -935,6 +935,7 @@ static uint8_t cmos_floppy_type(uint32_t size) {
 void io_cmos_sync_floppies(void) {
   uint8_t a = floppy_get_data(0) ? cmos_floppy_type(floppy_get_size(0)) : 0;
   uint8_t b = floppy_get_data(1) ? cmos_floppy_type(floppy_get_size(1)) : 0;
+  // 装了什么就报什么：A: 有镜像报 A: 类型，B: 为 null/无镜像则不报（标记没有）。
   int n = (a ? 1 : 0) + (b ? 1 : 0);
 
   cmos_rtc[0x10] = (uint8_t)((a << 4) | b);
@@ -966,6 +967,8 @@ static void post_fixup_floppy_equip(void) {
     uint8_t a = (uint8_t)(cmos_rtc[0x10] >> 4);      // A: 类型（高 4 位）
     uint8_t b = (uint8_t)(cmos_rtc[0x10] & 0x0F);    // B: 类型（低 4 位）
     int n = (a ? 1 : 0) + (b ? 1 : 0);
+    fprintf(stderr, "[FIXUP] called a=%u b=%u n=%d BDA0x10=%04X cs=%04X ip=%04X\n",
+            a, b, n, read_word(0x0040, 0x0010), cpu.cs, cpu.ip);
     if (!n) return;
 
     write_byte(0x0040, 0x0090, a);                   // BDA 0x90：A: 类型
@@ -975,6 +978,7 @@ static void post_fixup_floppy_equip(void) {
     eq |= 0x0001;                                    // bit0 = 装了软驱
     eq = (uint16_t)((eq & ~0x00C0) | ((n - 1) << 6)); // bits6-7 = 台数−1
     write_word(0x0040, 0x0010, eq);
+    fprintf(stderr, "[FIXUP] wrote BDA0x10=%04X 0x90=%02X 0x91=%02X\n", eq, a, b);
 }
 
 // ============================================================
@@ -1435,6 +1439,9 @@ void io_write_port(uint16_t port, uint8_t val) {
     case 0x71: {
       uint8_t idx = cmos_index & 0x7F;
       cmos_rtc[idx] = val;
+      if (idx == 0x0E) fprintf(stderr, "[CMOS] write diag 0x0E=%02X @ CS=%04X:%04X [10=%02X 12=%02X 14=%02X 15=%02X 16=%02X]\n",
+                                   val, cpu.cs, cpu.ip, cmos_rtc[0x10], cmos_rtc[0x12], cmos_rtc[0x14], cmos_rtc[0x15], cmos_rtc[0x16]);
+      if (idx == 0x0E) { io_keyboard_push(0x3B); io_keyboard_push_release(0x3B); }  // DBG: 自动按 F1 推进引导
       // 状态 B（0x0B）写：若使能了某个 RTC 中断（PIE/AE/UIE，位 6/5/4），
       // 模拟"该中断已发生"——置状态 C（0x0C）对应标志并挂一个 IRQ8 待投。
       // AT POST 的 163 自检就是等这次 IRQ8 把 [40:6B] 置 1，缺它就会报 163。

@@ -7,12 +7,23 @@
 #include <stdlib.h>
 
 typedef struct {
-	uint16_t ax, bx, cx, dx;
-	uint16_t si, di, bp, sp;
+	// ---- 32 位通用寄存器（真正 32 位存储）----
+	//   eax/ebx/... 为全 32 位；ax/bx/... 为低 16 位；
+	//   al/ah/bl/bh/... 为低 8 / 高 8 位；si/esi、di/edi、bp/ebp、sp/esp、
+	//   ip/eip、flags/eflags 同理。8086 实模式只写低 16 位（高 16 位恒为 0），
+	//   386 保护模式下 32 位操作数（0x66 前缀）写全 32 位。
+	union { uint32_t eax; uint16_t ax; struct { uint8_t al; uint8_t ah; }; };
+	union { uint32_t ebx; uint16_t bx; struct { uint8_t bl; uint8_t bh; }; };
+	union { uint32_t ecx; uint16_t cx; struct { uint8_t cl; uint8_t ch; }; };
+	union { uint32_t edx; uint16_t dx; struct { uint8_t dl; uint8_t dh; }; };
+	union { uint32_t esi; uint16_t si; };
+	union { uint32_t edi; uint16_t di; };
+	union { uint32_t ebp; uint16_t bp; };
+	union { uint32_t esp; uint16_t sp; };
 	uint16_t cs, ds, es, ss;
 	uint16_t fs, gs;
-	uint16_t ip;
-	uint16_t flags;
+	union { uint32_t eip;    uint16_t ip; };
+	union { uint32_t eflags; uint16_t flags; };
 	bool prefix_66;   // 32 位操作数
         bool prefix_67;   // 32 位地址
 	// ---- 286 保护模式的段缓存：选择子对应的基址/限长 ----
@@ -102,7 +113,7 @@ void cpu_request_reset(void);
 //   read_word 本身也是函数），实测把 POST 阶段的墙钟时间拖长了好几倍。
 // 板上已装 RAM 上限：AT POST 的扩展内存自检靠"写模式 / 读回比对"，
 //   所以 >1MB 必须真的能存能取；若像 XT 那样读回 0xFF，POST 会判定没有扩展内存。
-#define CPU_RAM_INSTALLED  0x200000u
+#define CPU_RAM_INSTALLED  memory_size   // 跟随 memory_size（运行时可改，见 cpu.c）
 extern bool cpu_rom_write_protect;
 static inline uint8_t cpu_mem_read(uint32_t addr) {
 	addr = cpu_a20_enabled ? (addr & 0xFFFFFF) : (addr & 0xFFFFF);

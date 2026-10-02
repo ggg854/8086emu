@@ -1,9 +1,9 @@
 {
   "bios":"D:\\dos86\\data\\IBMATBIOS.BIN",
   "disk":"",
-  "floppy_a":"C:\\Users\\ASUS\\Desktop\\DISK01.IMG",
+  "floppy_a":null,
   "floppy_b":null,
-  "cpu_mhz":20,
+  "cpu_mhz":10,
   "composite":false,
   "console":false,
   "debug":false

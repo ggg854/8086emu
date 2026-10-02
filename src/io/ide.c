@@ -538,6 +538,14 @@ static bool int13_stub_ready = false;
 
 // 每次执行到 INT 13h 指令时调用：向量又回到 ROM 就（重新）装桩
 void ide_int13_prepare(void) {
+    // AT（286）BIOS 自带完整的 INT 13h：软盘处理程序在 F000，硬盘走 IDE 端口（由
+    // ide.c 模拟）。这里不能装桩——桩固定在 C800:0000，而 AT 自带硬盘 BIOS 也会
+    // 往 C800:0000 拷贝代码，二者冲突：后者覆盖桩的远跳目标字节，使软盘引导经桩
+    // jmp 到垃圾地址（0883:674A）→ IRET 弹回 0:0 → 跑飞（Fly 0:0）。
+    // 桩只服务于没有硬盘 BIOS 的 XT；AT 直接让 BIOS 原生处理 INT 13h 即可。
+    if (cpu_is_286)
+        return;
+
     uint16_t off = read_word(0, 0x13 * 4);
     uint16_t seg = read_word(0, 0x13 * 4 + 2);
     bool vector_is_stub = (seg == INT13_STUB_SEG && off == INT13_STUB_OFF);
