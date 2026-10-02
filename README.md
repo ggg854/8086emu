@@ -2,7 +2,7 @@
 <img width="640" height="470" alt="image" src="https://github.com/user-attachments/assets/6c6527e1-0873-4c92-a546-173a44861738" />
 
 
-it's ONLY can select CGA driver(VGA driver is black screen) windows2.03
+
 
 \# 8086/80286 PC Emulator
 WARNING: This binary is NOT statically linked.
@@ -43,7 +43,7 @@ supports hard disk, floppy, FPU, and 80286 protected mode.
 
 \- ✅ \*\*PCXTBIOS (Turbo XT BIOS v2.5)\*\* — works
 
-\- ❌ \*\*IBM PC/AT BIOS\*\* — currently fails with a triple fault(cpu fly). 
+\- ✅ \*\*IBM PC/AT BIOS\*\* — works and ROM BASIC
 
 
 \## Build
