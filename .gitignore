@@ -3,6 +3,9 @@
 *.exe
 build/
 
+# 便携打包产物（exe + 依赖 DLL + data 副本，体积大，不入库）
+dist/
+
 # 磁盘镜像与运行时状态（不入库）
 *.img
 *.ima
