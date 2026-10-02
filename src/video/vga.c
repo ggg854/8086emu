@@ -90,6 +90,14 @@ static bool    cga_bw = false;         // 0x3D8 bit2：黑白模式
 uint8_t vga_read_cga_mode(void)  { return cga_mode_reg; }
 uint8_t vga_read_cga_color(void) { return cga_color_reg; }
 
+// 逐扫描线寄存器阴影：8088 MPH 之类靠"逐行改写 0x3D9 背景色"移相来生成伪色（1024 色），
+// 而渲染每帧只做一次、读到的是帧末的最终值。这里在每次写 0x3D9/0x3D8 时，按"写那一刻的
+// 扫描线"记录进阴影数组；渲染时按行取当时的寄存器值，伪色移相才正确。
+//   cga_line_fid[y] == cga_frame_id 才表示该行本帧被写过，否则回退到全局当前值。
+static uint8_t  cga_line_color[200];
+static uint32_t cga_line_fid[200];
+static uint32_t cga_frame_id = 0;
+
 // ============================================================
 // 调色板
 // ============================================================
@@ -492,6 +500,9 @@ void vga_write_cga_mode(uint8_t val) {
 
 void vga_write_cga_color(uint8_t val) {
   cga_color_reg = val;
+  // 记录逐扫描线阴影：写这一刻正在显示的扫描行用这个 0x3D9 值
+  int ln = vga_current_scanline();
+  if (ln >= 0 && ln < 200) { cga_line_color[ln] = val; cga_line_fid[ln] = cga_frame_id; }
 }
 
 // CGA 4 色调色板：模式 4/5 用
@@ -844,20 +855,22 @@ bool vga_render(void) {
             comp_prepare();
             static uint8_t  idx[320];
             static uint32_t line[320];
-            uint8_t pidx[4];
-            pidx[0] = cga_color_reg & 0x0F;
-            if (cga_bw) {
-                pidx[1] = pidx[2] = pidx[3] = 15;
-            } else {
-                static const uint8_t p0[3] = { 2, 4, 6 };
-                static const uint8_t p1[3] = { 3, 5, 7 };
-                for (int i = 0; i < 3; i++) {
-                    uint8_t v = (cga_color_reg & 0x20) ? p1[i] : p0[i];
-                    if (cga_color_reg & 0x10) v |= 0x08;
-                    pidx[i + 1] = v;
-                }
-            }
             for (int y = 0; y < 200; y++) {
+                // 逐行取当时的 0x3D9：8088MPH 靠逐行改背景色把色度相位偏移，生成伪色
+                uint8_t creg = (cga_line_fid[y] == cga_frame_id) ? cga_line_color[y] : cga_color_reg;
+                uint8_t pidx[4];
+                pidx[0] = creg & 0x0F;
+                if (cga_bw) {
+                    pidx[1] = pidx[2] = pidx[3] = 15;
+                } else {
+                    static const uint8_t p0[3] = { 2, 4, 6 };
+                    static const uint8_t p1[3] = { 3, 5, 7 };
+                    for (int i = 0; i < 3; i++) {
+                        uint8_t v = (creg & 0x20) ? p1[i] : p0[i];
+                        if (creg & 0x10) v |= 0x08;
+                        pidx[i + 1] = v;
+                    }
+                }
                 int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
                 const uint8_t* src = &memory[base];
                 for (int x = 0; x < 320; x++) {
@@ -905,10 +918,11 @@ bool vga_render(void) {
             // 模式 6（640x200 2 色）前景恒为白(15)，背景 = 0x3D9 位 0-3。
             // 8088MPH 通过改变背景色寄存器把色度相位偏移，生成复合伪色（1024 色），
             // 故背景必须用真实调色板色（带 chroma），不能用硬编码的 0（黑），否则
-            // 伪色相位恒定、整幅画面颜色错乱。
-            uint8_t bg6 = cga_color_reg & 0x0F;
+            // 伪色相位恒定、整幅画面颜色错乱。逐行取当时的 0x3D9 才能还原移相。
             uint8_t fg6 = 0x0F;
             for (int y = 0; y < 200; y++) {
+                uint8_t creg = (cga_line_fid[y] == cga_frame_id) ? cga_line_color[y] : cga_color_reg;
+                uint8_t bg6 = creg & 0x0F;
                 int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
                 const uint8_t* src = &memory[base];
                 for (int x = 0; x < 640; x++)
@@ -919,6 +933,7 @@ bool vga_render(void) {
                 memcpy(&px[(dy + 1) * W], line, 640 * 4);
             }
             cairo_surface_mark_dirty(vga.surface);
+            cga_frame_id++;
             return true;
         }
         for (int y = 0; y < 200; y++) {
@@ -951,6 +966,7 @@ bool vga_render(void) {
     }
 
     cairo_surface_mark_dirty(vga.surface);
+    cga_frame_id++;
     return true;
 }
 

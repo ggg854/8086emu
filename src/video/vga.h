@@ -64,6 +64,9 @@ void    vga_write_cga_mode(uint8_t val);    // 写 0x3D8
 uint8_t vga_read_cga_mode(void);            // 读 0x3D8
 void    vga_write_cga_color(uint8_t val);   // 写 0x3D9
 uint8_t vga_read_cga_color(void);           // 读 0x3D9
+// 由 cpu_cycles + CRTC 寄存器推导"当前正在显示的扫描线"（0..199）。
+// 8088 MPH 之类靠逐扫描线改写 0x3D9 移相来生成伪色，渲染必须按行取当时的寄存器值。
+int     vga_current_scanline(void);
 
 // ---- 复合视频伪色（NTSC artifact colors）----
 //   CGA 的复合输出把 R/G/B 三路分别门控 0°/120°/240° 的 3.58MHz 色载波，

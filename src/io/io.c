@@ -1554,6 +1554,22 @@ void io_reset(void) {
 // 初始化 CMOS
 // ============================================================
 __attribute__((constructor))
+// 由 cpu_cycles + CRTC 寄存器推导"当前正在显示的扫描线"（0..199）。
+// 与 0x3DA 状态口的时序算法完全一致，8088 MPH 之类靠逐行改写 0x3D9 把色度相位偏移
+// 来生成伪色（1024 色模式），渲染必须按行取当时的寄存器值，这个函数把"写寄存器那一刻"
+// 对应到正确的扫描行，供 vga.c 记录逐行阴影使用。
+int vga_current_scanline(void) {
+    uint64_t cpt = ((uint64_t)(crtc_regs[0] & 0xFF) + 1) * 8 * CPU_CLK_HZ / CGA_DOT_HZ;
+    if (cpt == 0) cpt = 8 * CPU_CLK_HZ / CGA_DOT_HZ;
+    uint32_t lines = ((uint32_t)(crtc_regs[4] & 0xFF) + 1)
+                   * ((uint32_t)(crtc_regs[9] & 0x1F) + 1)
+                   + (uint32_t)(crtc_regs[5] & 0x1F);
+    if (lines == 0) lines = 262;
+    uint32_t pos  = (uint32_t)(cpu_cycles % (cpt * lines));
+    uint32_t line = (uint32_t)(pos / cpt);
+    return (int)(line % 200);
+}
+
 static void io_init_constructor(void) {
   if (!cmos_load()) { cmos_init(); cmos_save(); }
   // ★ shutdown byte（0x0F）语义上是"上一次关机/重启的方式"，真机一上电 BIOS 就
