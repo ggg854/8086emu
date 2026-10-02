@@ -9,72 +9,140 @@
 IDEDisk ide_disk;
 
 // ============================================================
-// IDE 控制器寄存器（ATA PIO）
+// IDE 控制器（ATA PIO）—— 完整实现
+//   任务文件：0x1F0 数据 / 0x1F1 错误(读)·特征(写) / 0x1F2 扇区计数 /
+//             0x1F3 LBA低·CHS扇区 / 0x1F4 LBA中·柱面低 / 0x1F5 LBA高·柱面高 /
+//             0x1F6 设备·磁头(bit6=LBA, bit4=设备, bit0-3=磁头或 LBA24-27) /
+//             0x1F7 状态(读)·命令(写)
+//   控制口：  0x3F6 读=备用状态（与 0x1F7 同值，但不清除中断）/ 写=设备控制
+//             （bit1 nIEN=禁止 INTRQ，bit2 SRST=软件复位）
+//   中断：    IRQ14（从片 IRQ6 → INT 76h）
 // ============================================================
-static uint8_t ide_error = 0;           // 0x1F1 读：错误码
-static uint8_t ide_features = 0;        // 0x1F1 写：features
-static uint8_t ide_sector_count = 0;    // 传输扇区数（0 表示 256）
-static uint8_t ide_sector_num = 0;      // LBA0-7 / CHS 扇区号（1 起）
-static uint8_t ide_cylinder_low = 0;    // LBA8-15
-static uint8_t ide_cylinder_high = 0;   // LBA16-23
-static uint8_t ide_drive_head = 0;      // bit4 设备 bit6 LBA 模式 LBA24-27
-static uint8_t ide_status = 0;
+static uint8_t ide_error = 0;           // 0x1F1 读：错误码 / 自检诊断码
+static bool    ide_err_bit = false;     // 状态寄存器 ERR 位。与错误寄存器分开：
+                                        // EXECUTE DEVICE DIAGNOSTIC 自检通过时错误
+                                        // 寄存器放诊断码 0x01，但不置 ERR 位。
+static uint8_t ide_features = 0;        // 0x1F1 写
+static uint8_t ide_sector_count = 0;    // 0x1F2（写 0 表示 256 扇区）
+static uint8_t ide_sector_num = 0;      // 0x1F3
+static uint8_t ide_cylinder_low = 0;    // 0x1F4
+static uint8_t ide_cylinder_high = 0;   // 0x1F5
+static uint8_t ide_drive_head = 0;      // 0x1F6
+static uint8_t ide_status = 0;          // 0x1F7 读（由 ide_update_status 组装）
 static uint8_t ide_command = 0;
+static uint8_t ide_dev_ctrl = 0;        // 0x3F6 写入的设备控制值
+
+// 状态机标志（真正的状态源，ide_status 只是它们的组装结果）
+static bool ide_bsy = false;            // 忙
+static bool ide_drq = false;            // 数据传送请求
+static bool ide_irq = false;            // IRQ14 待投递
+
+// 当前 CHS 几何：可由 INITIALIZE DEVICE PARAMETERS（0x91）改写磁头数与每道扇区数
+static uint32_t geom_heads = IDE_HEADS;
+static uint32_t geom_spt   = IDE_SPT;
+static uint32_t geom_cyl   = IDE_CYLINDERS;
 
 // ---- 数据阶段：512 字节暂存扇区 ----
 static union { uint8_t b[IDE_SECTOR_SIZE]; uint16_t w[IDE_SECTOR_SIZE / 2]; } ide_buf;
 static uint32_t ide_buf_pos = 0;
-static bool     ide_drq = false;          // DRQ：可读/写数据端口
-static bool     ide_buf_is_write = false; // true：主机写入（写盘命令）
-static bool     ide_is_identify = false;  // 当前数据块是 IDENTIFY 响应
+static bool     ide_buf_is_write = false; // true：主机→设备（写盘）
+static bool     ide_is_identify = false;  // 当前块是 IDENTIFY 响应
 static uint32_t ide_cur_lba = 0;          // 正在传输的扇区
 static uint16_t ide_sectors_left = 0;     // 本次命令剩余扇区数
 static bool     ide_dirty = false;        // 有写盘，退出时需要落盘
-static bool     ide_irq = false;          // IRQ14 待投递
 
-#define IDE_ST_BSY   0x80
-#define IDE_ST_DRDY  0x40
-#define IDE_ST_DF    0x20
-#define IDE_ST_DSC   0x10
-#define IDE_ST_DRQ   0x08
 #define IDE_ST_ERR   0x01
+#define IDE_ST_IDX   0x02
+#define IDE_ST_CORR  0x04
+#define IDE_ST_DRQ   0x08
+#define IDE_ST_DSC   0x10
+#define IDE_ST_DF    0x20
+#define IDE_ST_DRDY  0x40
+#define IDE_ST_BSY   0x80
 #define IDE_ST_READY (IDE_ST_DRDY | IDE_ST_DSC)                // 0x50
 #define IDE_ST_DATA  (IDE_ST_DRDY | IDE_ST_DSC | IDE_ST_DRQ)   // 0x58
 
+#define IDE_ERR_AMNF 0x01
+#define IDE_ERR_TKNF 0x02
 #define IDE_ERR_ABRT 0x04      // 命令被拒绝
+#define IDE_ERR_MCR  0x08
 #define IDE_ERR_IDNF 0x10      // 扇区号无效
+#define IDE_ERR_UNC  0x40
 
 extern bool debug_mode;
 
-static void ide_trace(const char* what, uint8_t cmd);   // 临时诊断（见下方定义）
+static void ide_trace(const char* what, uint8_t cmd);            // 临时诊断（见下方定义）
+static void ide_trace_data(const char* what, uint32_t lba, const uint8_t* b);
 
-// 错误 / 成功：置状态位
-static void ide_set_error(uint8_t code) {
-    ide_error = code;
-    ide_drq = false;
-    ide_status = IDE_ST_READY | IDE_ST_ERR;
-    if (debug_mode) printf("[IDE] command %02X error, error code %02X\n", ide_command, code);
-    ide_trace("ERR", ide_command);
+// 组装 0x1F7 状态字节
+static void ide_update_status(void) {
+    if (ide_bsy) { ide_status = IDE_ST_BSY; return; }
+    uint8_t s = IDE_ST_DRDY | IDE_ST_DSC;
+    if (ide_err_bit) s |= IDE_ST_ERR;
+    if (ide_drq)     s |= IDE_ST_DRQ;
+    ide_status = s;
 }
 
-// 设备控制寄存器（0x3F6 写）bit1 = nIEN：1 时禁止 INTRQ
-static bool ide_nien = false;
-
-// 投 IRQ14（被 nIEN 屏蔽时静默丢弃）
+// 投 IRQ14（nIEN 置位时被屏蔽）
 static void ide_raise_irq(void) {
-    if (!ide_nien) ide_irq = true;
+    if (!(ide_dev_ctrl & 0x02)) ide_irq = true;
 }
 
-// 0x3F6 写：IDE 设备控制寄存器（目前只有 nIEN 有实际意义）
+static void ide_reset_ata(void);   // 前向声明（下面的 ide_write_alt 会用到）
+
+// 0x3F6 写：设备控制寄存器
+//   SRST 由 0→1 时复位设备；由 1→0（撤销复位）时自检结束，错误寄存器放诊断码 0x01
 void ide_write_alt(uint8_t val) {
-    ide_nien = (val & 0x02) != 0;
+    uint8_t prev = ide_dev_ctrl;
+    ide_dev_ctrl = val;
+    if ((val & 0x04) && !(prev & 0x04)) {
+        ide_reset_ata();
+    } else if (!(val & 0x04) && (prev & 0x04)) {
+        ide_error = 0x01;          // 诊断码：设备 0 自检通过
+        ide_err_bit = false;       // 但不置 ERR 位
+        ide_bsy = false; ide_drq = false;
+        ide_update_status();
+    }
 }
 
-static void ide_ok(bool irq) {
-    ide_error = 0;
+// 控制器复位（上电 / SRST / DEVICE RESET）
+static void ide_reset_ata(void) {
+    ide_bsy = false; ide_drq = false; ide_irq = false;
+    ide_error = 0x01;              // 复位后诊断码：主盘通过
+    ide_err_bit = false;
+    ide_sector_count = 1; ide_sector_num = 1;
+    ide_cylinder_low = 0; ide_cylinder_high = 0; ide_drive_head = 0;
+    ide_buf_pos = 0; ide_sectors_left = 0;
+    ide_buf_is_write = false; ide_is_identify = false;
+    geom_heads = IDE_HEADS; geom_spt = IDE_SPT; geom_cyl = IDE_CYLINDERS;
+    ide_update_status();
+}
+
+// 命令结束：ok=true 成功，否则填错误码并置 ERR 位
+static void ide_cmd_done(bool ok, uint8_t errcode, bool irq) {
+    ide_bsy = false;
     ide_drq = false;
-    ide_status = IDE_ST_READY;
+    ide_buf_is_write = false;
+    if (ok) {
+        ide_error = 0; ide_err_bit = false;
+    } else {
+        ide_error = errcode; ide_err_bit = true;
+        ide_trace("ERR", ide_command);
+        if (debug_mode) printf("[IDE] command %02X error, code %02X\n", ide_command, errcode);
+    }
+    ide_update_status();
     if (irq) ide_raise_irq();
+}
+
+// 进入/继续数据阶段：一个 512 字节块已就绪
+//   ATA 的 PIO 时序：DRQ 置位时即断言 INTRQ，由 INT 76h 的中断服务程序搬数据；
+//   搬完最后一块再断言一次表示命令完成。只在"命令完成"才投 IRQ 会让中断方式
+//   读盘的 BIOS 发完 READ 就一直等 IRQ14，而数据永远没人来取 → 互相等待死锁。
+static void ide_block_ready(void) {
+    ide_bsy = false;
+    ide_drq = true;
+    ide_update_status();
+    ide_raise_irq();
 }
 
 // 本次传输扇区数（寄存器值 0 = 256）
@@ -82,9 +150,12 @@ static uint16_t ide_xfer_count(void) {
     return ide_sector_count ? ide_sector_count : 256;
 }
 
-// 由寄存器解析起始 LBA（LBA / CHS 两种寻址）
+// 由寄存器解析起始 LBA（LBA28 / CHS 两种寻址）
+//   CHS 用"当前几何"（geom_heads/geom_spt，可被 0x91 改写），而不是写死常量：
+//   BIOS 通过 INITIALIZE DEVICE PARAMETERS 下发的几何必须与这里一致，否则
+//   同一个 CHS 会被双方算成不同的 LBA（表现为写到了别处、format 校验失败）。
 static uint32_t ide_lba_from_regs(void) {
-    if (ide_drive_head & 0x40) {           // LBA 模式（bit6=1）
+    if (ide_drive_head & 0x40) {           // LBA28 模式（bit6=1）
         return ((uint32_t)(ide_drive_head & 0x0F) << 24)
              | ((uint32_t)ide_cylinder_high << 16)
              | ((uint32_t)ide_cylinder_low << 8)
@@ -94,8 +165,9 @@ static uint32_t ide_lba_from_regs(void) {
     uint32_t cyl  = ((uint32_t)ide_cylinder_high << 8) | ide_cylinder_low;
     uint32_t head = ide_drive_head & 0x0F;
     uint32_t sect = ide_sector_num;        // 1..SPT
-    if (sect == 0 || sect > IDE_SPT) return 0xFFFFFFFF;
-    return (cyl * IDE_HEADS + head) * IDE_SPT + (sect - 1);
+    if (sect == 0 || sect > geom_spt) return 0xFFFFFFFF;
+    if (head >= geom_heads)         return 0xFFFFFFFF;
+    return (cyl * geom_heads + head) * geom_spt + (sect - 1);
 }
 
 // 载入下一扇区到暂存缓冲（读命令）
@@ -106,39 +178,53 @@ static bool ide_load_sector(uint32_t lba) {
     return true;
 }
 
+// ★ 临时诊断：记录写入扇区的 LBA 与首字节（定位 format 写失败，之后删）
+static void ide_trace_data(const char* what, uint32_t lba, const uint8_t* b) {
+    static int n = 0;
+    if (n > 400) return;
+    n++;
+    FILE* f = fopen("ide_data.log", "a");
+    if (!f) return;
+    fprintf(f, "%s lba=%-6u cyl=%u hd=%u sn=%u : %02X %02X %02X %02X %02X %02X %02X %02X\n",
+            what, lba, lba / (IDE_HEADS * IDE_SPT),
+            (lba / IDE_SPT) % IDE_HEADS, lba % IDE_SPT + 1,
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+    fclose(f);
+}
+
 // 把暂存缓冲写回镜像（写命令）
 static void ide_store_sector(uint32_t lba) {
     if (lba >= IDE_SECTORS) return;
+    ide_trace_data("WR", lba, ide_buf.b);
     memcpy(ide_disk.data + (size_t)lba * IDE_SECTOR_SIZE, ide_buf.b, IDE_SECTOR_SIZE);
     ide_dirty = true;
 }
 
-// 启动读 / 写数据阶段
-static void ide_start_transfer(bool is_write) {
-    uint32_t lba = ide_lba_from_regs();
-    if (!ide_disk.present || lba == 0xFFFFFFFF || lba >= IDE_SECTORS) {
-        ide_set_error(IDE_ERR_IDNF);
+// 一个数据块（512 字节）搬完后的推进：
+//   · 还有剩余扇区 → 准备下一块（DRQ + INTRQ）
+//   · 已全部搬完   → 命令完成（INTRQ）
+static void ide_block_done(void) {
+    if (ide_is_identify) {              // IDENTIFY 的数据块搬完不产生中断
+        ide_is_identify = false;
+        ide_drq = false;
+        ide_error = 0; ide_err_bit = false;
+        ide_update_status();
         return;
     }
-    ide_cur_lba      = lba;
-    ide_sectors_left = ide_xfer_count();
-    ide_buf_is_write = is_write;
-    ide_is_identify  = false;
-    ide_error        = 0;
-    if (is_write) {
+    if (ide_sectors_left > 0) ide_sectors_left--;
+    if (ide_sectors_left == 0) {
+        ide_cmd_done(true, 0, true);
+        return;
+    }
+    ide_cur_lba++;
+    if (ide_cur_lba >= IDE_SECTORS) { ide_cmd_done(false, IDE_ERR_IDNF, true); return; }
+    if (ide_buf_is_write) {
         memset(ide_buf.b, 0, IDE_SECTOR_SIZE);
-        ide_buf_pos = 0;
-    } else if (!ide_load_sector(lba)) {
-        ide_set_error(IDE_ERR_IDNF);
+    } else if (!ide_load_sector(ide_cur_lba)) {
+        ide_cmd_done(false, IDE_ERR_IDNF, true);
         return;
     }
-    ide_drq = true;
-    ide_status = IDE_ST_DATA;
-    // ★ ATA 的 PIO 时序：准备好传一个数据块（DRQ 置位）时就会断言 INTRQ，
-    //   由 INT 76h 的中断服务程序来搬数据；搬完最后一块再断言一次表示命令完成
-    //   （见 ide_ok）。之前只在"命令完成"时才投 IRQ，于是中断方式读盘的 BIOS
-    //   发完 READ 就一直等 IRQ14，而数据永远没人来取 → 互相等待死锁。
-    ide_raise_irq();
+    ide_block_ready();
 }
 
 // IDENTIFY DEVICE（0xEC）响应：256 个字
@@ -185,55 +271,107 @@ static void ide_trace(const char* what, uint8_t cmd) {
 static void ide_execute_command(uint8_t cmd) {
     ide_command = cmd;
     ide_irq = false;
+    ide_bsy = false;
+    ide_drq = false;
+    ide_buf_pos = 0;
     ide_trace("EXEC", cmd);
-    if (!ide_disk.present || (ide_drive_head & 0x10)) {   // 无盘 / 从盘不存在
-        ide_set_error(IDE_ERR_ABRT);
-        return;
-    }
+
+    // 从盘（bit4=1）不存在；EXECUTE DEVICE DIAGNOSTIC 例外——它要汇报两台设备的诊断码
+    if ((ide_drive_head & 0x10) && cmd != 0x90) { ide_cmd_done(false, IDE_ERR_ABRT, true); return; }
+    if (!ide_disk.present && cmd != 0x90)        { ide_cmd_done(false, IDE_ERR_ABRT, true); return; }
+
     switch (cmd) {
-        case 0xEC:                          // IDENTIFY DEVICE（不产生中断）
+        case 0xEC:                          // IDENTIFY DEVICE（数据块搬完不产生中断）
             ide_fill_identify();
             ide_is_identify  = true;
             ide_buf_is_write = false;
             ide_buf_pos      = 0;
-            ide_error        = 0;
-            ide_drq          = true;
-            ide_status       = IDE_ST_DATA;
-            break;
-        case 0x20: case 0x21:               // READ SECTOR(S)（带/不带重试）
-            ide_start_transfer(false);
-            break;
-        case 0x30: case 0x31:               // WRITE SECTOR(S)（带/不带重试）
-            ide_start_transfer(true);
-            break;
-        case 0x40: case 0x41: {             // READ VERIFY SECTOR(S)
+            ide_error = 0; ide_err_bit = false;
+            ide_bsy = false; ide_drq = true;
+            ide_update_status();
+            return;
+
+        case 0x20: case 0x21: {             // READ SECTOR(S)（带/不带重试）
             uint32_t lba = ide_lba_from_regs();
-            if (lba == 0xFFFFFFFF || lba + ide_xfer_count() > IDE_SECTORS)
-                ide_set_error(IDE_ERR_IDNF);
-            else
-                ide_ok(true);
-            break;
+            uint32_t n   = ide_xfer_count();
+            if (lba == 0xFFFFFFFF || n == 0 || lba + n > IDE_SECTORS) {
+                ide_cmd_done(false, IDE_ERR_IDNF, true); return;
+            }
+            ide_cur_lba = lba; ide_sectors_left = (uint16_t)n;
+            ide_buf_is_write = false; ide_is_identify = false;
+            ide_error = 0; ide_err_bit = false;
+            if (!ide_load_sector(lba)) { ide_cmd_done(false, IDE_ERR_IDNF, true); return; }
+            ide_block_ready();
+            return;
         }
+
+        case 0x30: case 0x31: {             // WRITE SECTOR(S)（带/不带重试）
+            uint32_t lba = ide_lba_from_regs();
+            uint32_t n   = ide_xfer_count();
+            if (lba == 0xFFFFFFFF || n == 0 || lba + n > IDE_SECTORS) {
+                ide_cmd_done(false, IDE_ERR_IDNF, true); return;
+            }
+            ide_cur_lba = lba; ide_sectors_left = (uint16_t)n;
+            ide_buf_is_write = true; ide_is_identify = false;
+            ide_error = 0; ide_err_bit = false;
+            memset(ide_buf.b, 0, IDE_SECTOR_SIZE);
+            ide_block_ready();               // 等主机送第一个块
+            return;
+        }
+
+        case 0x40: case 0x41: {             // READ VERIFY SECTOR(S)（不传数据）
+            uint32_t lba = ide_lba_from_regs();
+            uint32_t n   = ide_xfer_count();
+            if (lba == 0xFFFFFFFF || n == 0 || lba + n > IDE_SECTORS) {
+                ide_cmd_done(false, IDE_ERR_IDNF, true); return;
+            }
+            ide_cmd_done(true, 0, true);
+            return;
+        }
+
+        case 0x91: {                        // INITIALIZE DEVICE PARAMETERS：下发 CHS 几何
+            // 0x1F2 = 每道扇区数，0x1F6 低 4 位 = 磁头数-1。BIOS 下发的几何必须与
+            // 后续 CHS→LBA 用的几何一致，否则同一个 CHS 双方会算成不同的 LBA。
+            uint32_t spt   = ide_sector_count ? ide_sector_count : 256;
+            uint32_t heads = (uint32_t)(ide_drive_head & 0x0F) + 1;
+            if (spt)   geom_spt   = spt;
+            if (heads) geom_heads = heads;
+            geom_cyl = IDE_SECTORS / (geom_heads * geom_spt);
+            ide_cmd_done(true, 0, true);
+            return;
+        }
+
         case 0x10:                          // RECALIBRATE
         case 0x70:                          // SEEK
-        case 0x91:                          // INITIALIZE DEVICE PARAMETERS
+            ide_cmd_done(true, 0, true);
+            return;
+
+        case 0x90:                          // EXECUTE DEVICE DIAGNOSTIC
+            // 自检结果放错误寄存器（bit0=1：设备 0 通过），但不置状态寄存器的 ERR 位
+            ide_error = 0x01;
+            ide_err_bit = false;
+            ide_bsy = false; ide_drq = false;
+            ide_update_status();
+            ide_raise_irq();
+            return;
+
+        case 0x08:                          // DEVICE RESET
+            ide_reset_ata();
+            ide_raise_irq();
+            return;
+
         case 0xEF:                          // SET FEATURES
         case 0xE0:                          // STANDBY IMMEDIATE
         case 0xE1:                          // IDLE IMMEDIATE
-        case 0xE7:                          // FLUSH CACHE
-            ide_ok(true);
-            break;
-        case 0x90:                          // EXECUTE DEVICE DIAGNOSTIC
-            ide_error  = 0x01;              // bit0=1：主盘自检通过
-            ide_status = IDE_ST_READY;
-            ide_irq    = true;
-            break;
-        case 0x08:                          // DEVICE RESET
-            ide_ok(false);
-            break;
+        case 0xE7:                          // FLUSH CACHE（数据常驻内存镜像，无需动作）
+        case 0x50:                          // FORMAT TRACK（老式）
+        case 0x71: case 0x72: case 0x73: case 0x74:   // SEEK 变体
+            ide_cmd_done(true, 0, true);
+            return;
+
         default:                            // 未实现 → ABORT
-            ide_set_error(IDE_ERR_ABRT);
-            break;
+            ide_cmd_done(false, IDE_ERR_ABRT, true);
+            return;
     }
 }
 
@@ -289,7 +427,7 @@ void ide_init(void) {
         }
     }
 
-    ide_status = 0x50;
+    ide_reset_ata();     // 上电状态：DRDY+DSC、诊断码 0x01、默认几何
 
     // ---- 软盘：默认空白（两台都先挂上），等 dos86.c 调 ide_mount_floppy ----
     for (int d = 0; d < FLOPPY_DRIVES; d++) {
@@ -449,39 +587,28 @@ void ide_cleanup(void) {
 // ============================================================
 uint8_t ide_read_port(uint16_t port) {
     switch (port) {
-    case 0x1F0: {
-		if (!ide_drq) return 0;
-		uint8_t v = ide_buf.b[ide_buf_pos++];
-		vga_led_activity(0);
-		if (ide_buf_pos >= IDE_SECTOR_SIZE) {
-			ide_buf_pos = 0;
-			if (ide_is_identify) {
-				ide_is_identify = false;
-				ide_drq = false;
-				ide_status = IDE_ST_READY;
-			} else {
-				if (ide_sectors_left > 0) ide_sectors_left--;
-				if (ide_sectors_left == 0) {
-					ide_ok(true);
-				} else {
-					ide_cur_lba++;
-					if (!ide_load_sector(ide_cur_lba)) {
-						ide_set_error(IDE_ERR_IDNF);
-						return v;
-					}
-					ide_drq = true;               // ★ 加这行
-					ide_status = IDE_ST_DATA;
-				}
-			}
-		}
-		return v;
-	}
+    case 0x1F0: {                       // 数据口：从当前块取一个字节
+        if (!ide_drq) return 0;
+        uint8_t v = ide_buf.b[ide_buf_pos];
+        if (ide_buf_pos == 0) ide_trace("RD1", ide_command);
+        ide_buf_pos++;
+        vga_led_activity(0);
+        if (ide_buf_pos >= IDE_SECTOR_SIZE) {
+            ide_trace("RDEND", ide_command);
+            ide_buf_pos = 0;
+            ide_block_done();           // 一块搬完：推进/结束命令
+        }
+        return v;
+    }
         case 0x1F1: return ide_error;
         case 0x1F2: return ide_sector_count;
         case 0x1F3: return ide_sector_num;
         case 0x1F4: return ide_cylinder_low;
         case 0x1F5: return ide_cylinder_high;
         case 0x1F6: return ide_drive_head;
+        // 状态口。ATA 规定读常规状态口会清掉 pending 的中断；这里刻意不清——
+        // 中断是靠 io_ide_poll 异步投递的，若在这里清掉，BIOS 读一次状态就把
+        // INTRQ 抹了，再也等不到 INT 76h（死锁）。
         case 0x1F7: return ide_status;
         default: return 0;
     }
@@ -492,25 +619,20 @@ uint8_t ide_read_port(uint16_t port) {
 // ============================================================
 void ide_write_port(uint16_t port, uint8_t val) {
     switch (port) {
-    case 0x1F0: {
-		if (!ide_drq || !ide_buf_is_write) break;
-		ide_buf.b[ide_buf_pos++] = val;
-		vga_led_activity(0);
-		if (ide_buf_pos >= IDE_SECTOR_SIZE) {
-			ide_buf_pos = 0;
-			ide_store_sector(ide_cur_lba);
-			if (ide_sectors_left > 0) ide_sectors_left--;
-			if (ide_sectors_left == 0) {
-				ide_ok(true);
-			} else {
-				ide_cur_lba++;
-				memset(ide_buf.b, 0, IDE_SECTOR_SIZE);
-				ide_drq = true;               // ★ 加这行
-				ide_status = IDE_ST_DATA;
-			}
-		}
-		break;
-	}
+    case 0x1F0: {                       // 数据口：往当前块写一个字节
+        if (!ide_drq || !ide_buf_is_write) break;
+        ide_buf.b[ide_buf_pos] = val;
+        if (ide_buf_pos == 0) ide_trace("WR1", ide_command);
+        ide_buf_pos++;
+        vga_led_activity(0);
+        if (ide_buf_pos >= IDE_SECTOR_SIZE) {
+            ide_trace("WREND", ide_command);
+            ide_buf_pos = 0;
+            ide_store_sector(ide_cur_lba);   // 落盘（内存镜像）
+            ide_block_done();                // 一块搬完：推进/结束命令
+        }
+        break;
+    }
         case 0x1F1: ide_features = val; break;
         case 0x1F2: ide_sector_count = val; break;
         case 0x1F3: ide_sector_num = val; break;
@@ -787,12 +909,8 @@ void ide_int13_handle(void) {
 // 不碰 ide_dirty / ide_disk.data —— 待落盘的改动要留着，软盘缓冲同样保留。
 // ============================================================
 void ide_reset(void) {
-    ide_error = 0; ide_features = 0; ide_sector_count = 0;
-    ide_sector_num = 0; ide_cylinder_low = 0; ide_cylinder_high = 0;
-    ide_drive_head = 0; ide_status = IDE_ST_READY; ide_command = 0;
-    ide_buf_pos = 0; ide_drq = false; ide_buf_is_write = false;
-    ide_is_identify = false; ide_cur_lba = 0; ide_sectors_left = 0;
-    ide_irq = false;
+    ide_features = 0;
+    ide_reset_ata();            // 统一的控制器复位（含几何恢复默认、状态组装）
     int13_stub_ready = false;   // 客机内存清零后重新装桩
 }
 
