@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <gtk/gtk.h>
 #include "config.h"
 #include "protect.h"
@@ -420,6 +421,20 @@ static void con_render(void) {
     fflush(stdout);
 }
 
+// tick() 的节流锚点。原来放在 tick 内部当 static，换机器重新启动时不会清零，
+// 会拿上一台机器的时间基准"补账"，故提到文件作用域，由 do_launch 复位。
+static uint64_t tick_anchor_us = 0, tick_anchor_cyc = 0;
+
+// ★ 临时诊断：把"CPU 为什么停下"写进 emu_trace.log，用于排查运行中途卡死（定位后删）
+static void emu_trace(const char* fmt, ...) {
+    FILE* f = fopen("emu_trace.log", "a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fclose(f);
+}
+
 static gboolean tick(gpointer data) {
     (void)data;
     static int halt_reported = 0;
@@ -443,23 +458,22 @@ static gboolean tick(gpointer data) {
     //   折合 ~600k 周期），所以"单帧上限"必须容得下一整帧应走的量，否则永远追不上：
     //   旧值 12000（≈2.5ms@4.77MHz）实测把整机压到只有 0.38MHz。
     gint64 now_us = g_get_monotonic_time();
-    static uint64_t anchor_us = 0, anchor_cyc = 0;
-    if (anchor_us == 0) { anchor_us = (uint64_t)now_us; anchor_cyc = cpu_cycles; }
+    if (tick_anchor_us == 0) { tick_anchor_us = (uint64_t)now_us; tick_anchor_cyc = cpu_cycles; }
 
     // 正值 = 欠客机的周期数
-    int64_t owed = (int64_t)anchor_cyc
-                 + (int64_t)(CPU_CYC_PER_MS * (now_us - (gint64)anchor_us) / 1000)
+    int64_t owed = (int64_t)tick_anchor_cyc
+                 + (int64_t)(CPU_CYC_PER_MS * (now_us - (gint64)tick_anchor_us) / 1000)
                  - (int64_t)cpu_cycles;
     if (owed < 0) {                     // 跑超前（时间抖动/中断补账）：重锚，避免空转
-        anchor_us = (uint64_t)now_us;
-        anchor_cyc = cpu_cycles;
+        tick_anchor_us = (uint64_t)now_us;
+        tick_anchor_cyc = cpu_cycles;
         owed = 0;
     }
     uint64_t cyc_budget = (uint64_t)owed;
 
     if (cyc_budget > CPU_CLK_HZ) {      // 落后 >1s（真·长停顿/系统挂起）：不追历史
-        anchor_us = (uint64_t)now_us;
-        anchor_cyc = cpu_cycles;
+        tick_anchor_us = (uint64_t)now_us;
+        tick_anchor_cyc = cpu_cycles;
         cyc_budget = 0;
     }
     if (cyc_budget > CPU_CYC_PER_MS * 50) cyc_budget = CPU_CYC_PER_MS * 50;   // 单帧上限 ≈50ms 的活
@@ -483,6 +497,9 @@ static gboolean tick(gpointer data) {
                    "CS=%04X IP=%04X FL=%04X (IF=%d) HLT count=%llu\n",
                    cpu.cs, cpu.ip, cpu.flags, (cpu.flags >> 9) & 1,
                    (unsigned long long)hlt_count);
+        emu_trace("HALT CS=%04X IP=%04X FL=%04X IF=%d hlt=%llu\n",
+                  cpu.cs, cpu.ip, cpu.flags, (cpu.flags >> 9) & 1,
+                  (unsigned long long)hlt_count);
         halt_reported = 1;
     }
         io_keyboard_poll();
@@ -499,8 +516,8 @@ static gboolean tick(gpointer data) {
             cpu_last_cycles = (uint32_t)adv;
             if (adv) io_pit_step((uint32_t)adv);
             cyc_budget = 0;                   // 仍无中断：本帧不跑指令，但渲染/标题照常
-            anchor_us = (uint64_t)now_us;     // 重置锚点，唤醒后不暴补
-            anchor_cyc = cpu_cycles;
+            tick_anchor_us = (uint64_t)now_us;     // 重置锚点，唤醒后不暴补
+            tick_anchor_cyc = cpu_cycles;
         } else {
     if (!console_mode)
         printf("[HALT] woken by interrupt, resuming CS=%04X IP=%04X\n",
@@ -553,6 +570,8 @@ static gboolean tick(gpointer data) {
                 for (int k = 0; k < 8; k++) fprintf(stderr, " %02X", cpu_mem_read(pa + k));
                 fprintf(stderr, "\n");
             }
+            emu_trace("FLY CS=%04X IP=%04X prev=%04X:%04X AX=%04X BX=%04X CX=%04X DX=%04X FL=%04X\n",
+                      cpu.cs, cpu.ip, last_cs, last_ip, cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.flags);
             cpu_running = false;
             break;   // ★ 跳出 while，不 return
         }
@@ -573,6 +592,9 @@ static gboolean tick(gpointer data) {
                        cpu.si, cpu.di, cpu.bp, cpu.sp);
                 printf("  DS=%04X ES=%04X SS=%04X FL=%04X\n",
                        cpu.ds, cpu.es, cpu.ss, cpu.flags);
+                emu_trace("LOOP CS=%04X IP=%04X byte=%02X %02X %02X AX=%04X BX=%04X CX=%04X DX=%04X FL=%04X\n",
+                          cpu.cs, cpu.ip, cpu_mem_read(addr), cpu_mem_read(addr + 1),
+                          cpu_mem_read(addr + 2), cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.flags);
                 cpu_running = false;
                 break;   // ★ 跳出 while，不 return
             }
@@ -998,6 +1020,12 @@ static void do_launch(const char* name) {
     }
     console_mode = cfg.console;
     debug_mode   = cfg.debug;
+    // ★ 从菜单重新启动：必须复位退出标志。emu_shutdown() 会把 emu_running 置 false，
+    //   若这里不重置，新开的 tick 第一帧就判定"要退出"→ 直接回菜单（无法二次启动）。
+    emu_running = true;
+    cpu_running = true;
+    cpu_halted  = false;
+    tick_anchor_us = tick_anchor_cyc = 0;   // 清掉上一台机器的时间基准
     gtk_widget_hide(g_manager);
     init_emulator(&cfg);
 

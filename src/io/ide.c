@@ -46,12 +46,15 @@ static bool     ide_irq = false;          // IRQ14 待投递
 
 extern bool debug_mode;
 
+static void ide_trace(const char* what, uint8_t cmd);   // 临时诊断（见下方定义）
+
 // 错误 / 成功：置状态位
 static void ide_set_error(uint8_t code) {
     ide_error = code;
     ide_drq = false;
     ide_status = IDE_ST_READY | IDE_ST_ERR;
     if (debug_mode) printf("[IDE] command %02X error, error code %02X\n", ide_command, code);
+    ide_trace("ERR", ide_command);
 }
 
 static void ide_ok(bool irq) {
@@ -148,9 +151,23 @@ static void ide_fill_identify(void) {
 }
 
 // 执行一条命令（写 0x1F7）
+// ★ 临时诊断：把每条命令写进 ide_trace.log（定位运行中途卡死用，之后删）
+static void ide_trace(const char* what, uint8_t cmd) {
+    static int n = 0;
+    if (n > 3000) return;
+    n++;
+    FILE* f = fopen("ide_trace.log", "a");
+    if (!f) return;
+    fprintf(f, "%s cmd=%02X drv=%02X cnt=%u sn=%u cl=%u ch=%u st=%02X irq=%d\n",
+            what, cmd, ide_drive_head, ide_sector_count, ide_sector_num,
+            ide_cylinder_low, ide_cylinder_high, ide_status, ide_irq ? 1 : 0);
+    fclose(f);
+}
+
 static void ide_execute_command(uint8_t cmd) {
     ide_command = cmd;
     ide_irq = false;
+    ide_trace("EXEC", cmd);
     if (!ide_disk.present || (ide_drive_head & 0x10)) {   // 无盘 / 从盘不存在
         ide_set_error(IDE_ERR_ABRT);
         return;
