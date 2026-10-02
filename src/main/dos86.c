@@ -972,8 +972,13 @@ static void manager_refresh(void) {
         gtk_container_add(GTK_CONTAINER(row), lbl);
         g_object_set_data_full(G_OBJECT(row), "name", g_strdup(nm), g_free);
         gtk_list_box_insert(g_mlist, row, -1);
+        gtk_widget_show_all(row);
     }
     g_list_free_full(names, g_free);
+    // 重新构建列表后，新插入的行默认不显示（初始 open_manager 靠外面的 show_all 才显示），
+    // 这里显式刷新，否则"新建/编辑/删除机器"后列表不更新，必须重启才看得到。
+    gtk_widget_show_all(GTK_WIDGET(g_mlist));
+    gtk_widget_queue_draw(GTK_WIDGET(g_mlist));
 }
 
 static void machine_err(const char* msg) {
