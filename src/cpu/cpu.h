@@ -79,6 +79,8 @@ extern bool cpu_prefix_step;
 void cpu_init(void);
 void cpu_reset(void);
 void cpu_execute_instruction(void);
+// 诊断：回放最近执行过的 CS:IP / 长度并做 IP 漂移检测（cpu.c 内实现）
+void itrace_dump(void);
 void cpu_interrupt(uint8_t int_num);
 // 异常/故障报告（除零、无效指令、通用保护、双重/三重故障）
 void cpu_fault_dump(const char* kind, uint8_t vector, const char* why);

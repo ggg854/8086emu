@@ -73,6 +73,7 @@ extern bool debug_mode;
 
 static void ide_trace(const char* what, uint8_t cmd);            // 临时诊断（见下方定义）
 static void ide_trace_data(const char* what, uint32_t lba, const uint8_t* b);
+static void ide_trace_reg(const char* tag, int val);
 
 // 组装 0x1F7 状态字节
 static void ide_update_status(void) {
@@ -95,6 +96,7 @@ static void ide_reset_ata(void);   // 前向声明（下面的 ide_write_alt 会
 void ide_write_alt(uint8_t val) {
     uint8_t prev = ide_dev_ctrl;
     ide_dev_ctrl = val;
+    ide_trace_reg("DEVCTRL", val);
     if ((val & 0x04) && !(prev & 0x04)) {
         ide_reset_ata();
     } else if (!(val & 0x04) && (prev & 0x04)) {
@@ -212,6 +214,9 @@ static void ide_block_done(void) {
         return;
     }
     if (ide_sectors_left > 0) ide_sectors_left--;
+    // 真实的 ATA：随传输推进同步更新扇区计数寄存器（完成时为 0）。
+    // 有些 BIOS/驱动在命令后回读 0x1F2 判断是否完成。
+    ide_sector_count = (uint8_t)(ide_sectors_left & 0xFF);
     if (ide_sectors_left == 0) {
         ide_cmd_done(true, 0, true);
         return;
@@ -266,6 +271,25 @@ static void ide_trace(const char* what, uint8_t cmd) {
             what, cmd, ide_drive_head, ide_sector_count, ide_sector_num,
             ide_cylinder_low, ide_cylinder_high, ide_status, ide_irq ? 1 : 0);
     fclose(f);
+}
+
+// ★ 临时诊断：状态口读取(变化时) / 设备控制写（定位后删）
+static void ide_trace_reg(const char* tag, int val) {
+    static int n = 0;
+    if (n > 3000) return;
+    n++;
+    FILE* f = fopen("ide_trace.log", "a");
+    if (!f) return;
+    fprintf(f, "%s val=%02X st=%02X err=%02X drq=%d bsy=%d\n",
+            tag, val & 0xFF, ide_status, ide_error, ide_drq ? 1 : 0, ide_bsy ? 1 : 0);
+    fclose(f);
+}
+
+// 备用状态口（0x3F6 读）：与 0x1F7 同值，但不清中断
+uint8_t ide_read_alt_status(void) {
+    static int last = -1;
+    if (ide_status != last) { last = ide_status; ide_trace_reg("ALTST", ide_status); }
+    return ide_status;
 }
 
 static void ide_execute_command(uint8_t cmd) {
@@ -600,8 +624,16 @@ uint8_t ide_read_port(uint16_t port) {
         }
         return v;
     }
-        case 0x1F1: return ide_error;
-        case 0x1F2: return ide_sector_count;
+        case 0x1F1: {
+            static int last = -1;
+            if (ide_error != last) { last = ide_error; ide_trace_reg("ERRREG", ide_error); }
+            return ide_error;
+        }
+        case 0x1F2: {
+            static int last = -1;
+            if (ide_sector_count != last) { last = ide_sector_count; ide_trace_reg("SECCNT", ide_sector_count); }
+            return ide_sector_count;
+        }
         case 0x1F3: return ide_sector_num;
         case 0x1F4: return ide_cylinder_low;
         case 0x1F5: return ide_cylinder_high;
@@ -609,7 +641,11 @@ uint8_t ide_read_port(uint16_t port) {
         // 状态口。ATA 规定读常规状态口会清掉 pending 的中断；这里刻意不清——
         // 中断是靠 io_ide_poll 异步投递的，若在这里清掉，BIOS 读一次状态就把
         // INTRQ 抹了，再也等不到 INT 76h（死锁）。
-        case 0x1F7: return ide_status;
+        case 0x1F7: {
+            static int last = -1;
+            if (ide_status != last) { last = ide_status; ide_trace_reg("ST", ide_status); }
+            return ide_status;
+        }
         default: return 0;
     }
 }

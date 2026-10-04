@@ -733,11 +733,10 @@ void io_fdc_poll(void) {
 static bool rtc_irq_pending;   // 前向声明：真正定义在文件后部 CMOS 区段（=false 初值）
 void io_rtc_poll(void) {
   if (!rtc_irq_pending) return;
-  if (pic_irq_masked(8)) { fprintf(stderr, "[RTCPOLL] masked\n"); return; }
-  if (!get_flag(FLAG_IF)) { fprintf(stderr, "[RTCPOLL] IF=0\n"); return; }
-  if (!vector_installed(pic_irq_vector(8))) { fprintf(stderr, "[RTCPOLL] vec not installed\n"); return; }
-  fprintf(stderr, "[RTCPOLL] DELIVER IRQ8 -> INT%02X at CS=%04X IP=%04X\n",
-          pic_irq_vector(8), cpu.cs, cpu.ip);
+  if (pic_irq_masked(8)) { return; }
+  if (!get_flag(FLAG_IF)) {  return; }
+  if (!vector_installed(pic_irq_vector(8))) {  return; }
+  
   rtc_irq_pending = false;
   pic_ack(8);
   cpu_interrupt(pic_irq_vector(8));
@@ -746,11 +745,23 @@ void io_rtc_poll(void) {
 // 硬盘中断（IRQ14 = 从片 IRQ6 → INT 76h）轮询投递。
 // 客机的 INT 13h 硬盘服务由模拟器内置（同步完成、不需要中断），
 // 这里只服务于直接操作 0x1F0 端口、自己挂 INT 76h 的程序。
+// ★ 临时诊断：IRQ14 投递/被挡原因（排查硬盘卡死，定位后删）
+static void ide_irq_trace(const char* what, int vec) {
+  static int n = 0;
+  if (n > 800) return;
+  n++;
+  FILE* f = fopen("ide_trace.log", "a");
+  if (!f) return;
+  fprintf(f, "IRQ14 %s vec=%02X\n", what, vec);
+  fclose(f);
+}
+
 void io_ide_poll(void) {
   if (!ide_irq_pending()) return;
-  if (pic_irq_masked(14)) return;
-  if (!get_flag(FLAG_IF)) return;
-  if (!vector_installed(pic_irq_vector(14))) return;
+  if (pic_irq_masked(14))            { ide_irq_trace("BLOCKED masked", pic_irq_vector(14)); return; }
+  if (!get_flag(FLAG_IF))            { ide_irq_trace("BLOCKED IF=0", pic_irq_vector(14)); return; }
+  if (!vector_installed(pic_irq_vector(14))) { ide_irq_trace("BLOCKED novec", pic_irq_vector(14)); return; }
+  ide_irq_trace("DELIVERED", pic_irq_vector(14));
   ide_irq_ack();
   pic_ack(14);
   cpu_interrupt(pic_irq_vector(14));
@@ -1001,16 +1012,25 @@ static void post_fixup_floppy_equip(void) {
     uint8_t a = (uint8_t)(cmos_rtc[0x10] >> 4);      // A: 类型（高 4 位）
     uint8_t b = (uint8_t)(cmos_rtc[0x10] & 0x0F);    // B: 类型（低 4 位）
     int n = (a ? 1 : 0) + (b ? 1 : 0);
-    fprintf(stderr, "[FIXUP] called a=%u b=%u n=%d BDA0x10=%04X cs=%04X ip=%04X\n",
-            a, b, n, read_word(0x0040, 0x0010), cpu.cs, cpu.ip);
-    if (!n) return;
-
-    write_byte(0x0040, 0x0090, a);                   // BDA 0x90：A: 类型
-    write_byte(0x0040, 0x0091, b);                   // BDA 0x91：B: 类型
+    
+    // 注意：不要在此早退 —— 下面的显示类型修正与有没有软驱无关，必须始终执行。
+    if (n) {
+        write_byte(0x0040, 0x0090, a);               // BDA 0x90：A: 类型
+        write_byte(0x0040, 0x0091, b);               // BDA 0x91：B: 类型
+    }
 
     uint16_t eq = read_word(0x0040, 0x0010);
-    eq |= 0x0001;                                    // bit0 = 装了软驱
-    eq = (uint16_t)((eq & ~0x00C0) | ((n - 1) << 6)); // bits6-7 = 台数−1
+    // ★ 设备字 bits4-5 = "初始显示类型"：00=EGA/VGA、01=40x25 彩色、10=80x25 彩色(CGA)、
+    //   11=MDA。本机装的是 IBM VGA（CMOS 0x14 bits5-4 也设为 00），但 POST 在这里把它
+    //   写成了 10(CGA)。后果：IBM VGA BIOS 初始化时据此把显示判定为 CGA（INT 10h
+    //   AH=1Ah/1Bh 返回显示组合码 2），于是拒绝一切图形模式（连 13h 都拒），退回 CGA
+    //   的 40x25 文本。这里按实际硬件修正回 00。时机上本函数在 POST 检查点 0x3C 触发，
+    //   早于选件 ROM 扫描执行显卡 BIOS，来得及生效。
+    eq = (uint16_t)(eq & ~0x0030);                   // bits4-5 = 00 → EGA/VGA
+    if (n) {
+        eq |= 0x0001;                                // bit0 = 装了软驱
+        eq = (uint16_t)((eq & ~0x00C0) | ((n - 1) << 6)); // bits6-7 = 台数−1
+    }
     write_word(0x0040, 0x0010, eq);
     fprintf(stderr, "[FIXUP] wrote BDA0x10=%04X 0x90=%02X 0x91=%02X\n", eq, a, b);
 }
@@ -1126,7 +1146,7 @@ uint8_t io_read_port(uint16_t port) {
     // ★ AT 上 0x3F6 是 IDE 的"备用状态口"（读它不会清除 pending 的 IRQ14），
     //   BIOS 在数据传输阶段常用它轮询 DRQ。之前被接到软驱（返回 0），于是
     //   BIOS 永远等不到就绪 → 发完 READ 后死循环（fdisk 选 1 卡死）。
-    case 0x3F6: ret = ide_read_port(0x1F7); break;
+    case 0x3F6: ret = ide_read_alt_status(); break;
     case 0x241: ret = 0x00; break;
     case 0x341: ret = 0x00; break;
     // ---- VGA ----
@@ -1246,6 +1266,23 @@ uint8_t io_read_port(uint16_t port) {
     default:
       ret = 0xFF;
       break;
+  }
+
+  // ★ 临时诊断：记录"显卡选件 ROM（CS=C0000-C7FFF）发起的端口读"。
+  //   显卡 BIOS 判定显示器类型（彩色/单色）时探测若干硬件端口，本机被误判成
+  //   单色/CGA，根因就在它读到的值里。
+  //   ★ 必须按端口去重：ROM 会不停轮询（如等垂直同步），逐条打印会把 stderr 刷爆
+  //     并把速度拖到 0MHz。这里每个端口只记第一次（首次读取发生在初始化阶段，
+  //     正是判定显示类型的时刻），查重用位图保持 O(1)。
+  if (cpu.cs >= 0xC000 && cpu.cs < 0xC800) {
+    static uint8_t seen[0x10000u / 8u];
+    static int     logged = 0;
+    uint8_t mask = (uint8_t)(1u << (port & 7u));
+    if (!(seen[port >> 3] & mask) && logged < 64) {
+      seen[port >> 3] |= mask;
+      logged++;
+      fprintf(stderr, "[VROM] in %04X -> %02X  @ %04X:%04X\n", port, ret, cpu.cs, cpu.ip);
+    }
   }
 
   return ret;
@@ -1450,6 +1487,7 @@ void io_write_port(uint16_t port, uint8_t val) {
     case 0x3C5:
     seq_regs[seq_index & 0x07] = val;
     vga_seq_regs[seq_index & 0x07] = val;   // ← 加这行
+    vga_update_mode();                      // ★ 从寄存器推导模式（文本↔图形）
     break;
     case 0x3C6: vga_dac_mask = val; break;
     case 0x3C7: vga_dac_read_index = val; dac_read_phase = 0; break;
@@ -1460,11 +1498,13 @@ void io_write_port(uint16_t port, uint8_t val) {
       if (dac_write_phase == 0) vga_dac_write_index++;
       break;
     case 0x3CE: gc_index = val & 0x0F; break;
-    case 0x3CF: gc_regs[gc_index & 0x0F] = val; vga_gc_regs[gc_index & 0x0F] = val; break;
+    case 0x3CF: gc_regs[gc_index & 0x0F] = val; vga_gc_regs[gc_index & 0x0F] = val; vga_update_mode(); break;
     case 0x3D4: crtc_index = val & 0x1F; break;
     case 0x3D5: {
       uint8_t idx = crtc_index & 0x1F;
       crtc_regs[idx] = val;
+      vga_crtc_regs[idx] = val;
+      vga_update_mode();
       break;
     }
     case 0x3DA: break;
@@ -1479,8 +1519,6 @@ void io_write_port(uint16_t port, uint8_t val) {
     case 0x71: {
       uint8_t idx = cmos_index & 0x7F;
       cmos_rtc[idx] = val;
-      if (idx == 0x0E) fprintf(stderr, "[CMOS] write diag 0x0E=%02X @ CS=%04X:%04X [10=%02X 12=%02X 14=%02X 15=%02X 16=%02X]\n",
-                                   val, cpu.cs, cpu.ip, cmos_rtc[0x10], cmos_rtc[0x12], cmos_rtc[0x14], cmos_rtc[0x15], cmos_rtc[0x16]);
       if (idx == 0x0E) { io_keyboard_push(0x3B); io_keyboard_push_release(0x3B); }  // DBG: 自动按 F1 推进引导
       // 状态 B（0x0B）写：若使能了某个 RTC 中断（PIE/AE/UIE，位 6/5/4），
       // 模拟"该中断已发生"——置状态 C（0x0C）对应标志并挂一个 IRQ8 待投。
@@ -1489,7 +1527,7 @@ void io_write_port(uint16_t port, uint8_t val) {
       if (idx == 0x0B && (val & 0x70)) {
         cmos_rtc[0x0C] |= (uint8_t)(val & 0x70);
         rtc_irq_pending = true;
-        fprintf(stderr, "[RTC] statusB write %02X -> IRQ8 pending (0x0C=%02X)\n", val, cmos_rtc[0x0C]);
+        
       }
       cmos_save();          // ★ 客机对 CMOS 的改动立刻落盘（POST/SETUP 写回不丢）
       break;
@@ -1507,8 +1545,7 @@ void io_write_port(uint16_t port, uint8_t val) {
     case 0x61: ppi_port_b = val; break;
 
     case 0x92:
-    fprintf(stderr, "[PORT92] write %02X (bit1=%d) @%04X:%04X\n",
-            val, (val >> 1) & 1, cpu.cs, cpu.ip);
+    
     cpu_set_a20((val & 0x02) != 0);
     break;
 

@@ -88,6 +88,10 @@ extern uint8_t vga_seq_regs[8];
 extern uint8_t vga_gc_regs[16];
 extern uint8_t vga_attr_regs[0x20];
 extern uint8_t vga_attr_palette[16];
+// ★ 从 VGA 寄存器（Sequencer/GC/CRTC）推导当前视频模式——客机显卡 ROM 接管 INT 10h
+//   后直接写寄存器进图形模式，必须据此把 vga.mode 从文本切到图形，否则会"退回文本模式"。
+extern uint8_t vga_crtc_regs[0x20];
+void vga_update_mode(void);
 uint8_t vga_mem_read(uint32_t off);
 void    vga_mem_write(uint32_t off, uint8_t val);
 bool    vga_mem_owns(uint32_t addr);   // 判断该地址是否落在 VGA 窗口

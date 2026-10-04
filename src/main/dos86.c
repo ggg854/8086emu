@@ -525,6 +525,7 @@ static gboolean tick(gpointer data) {
     halt_reported = 0;
         }
     }
+
     while (cyc_this_frame < cyc_budget &&
            emu_running && cpu_running) {
 
@@ -572,6 +573,7 @@ static gboolean tick(gpointer data) {
             }
             emu_trace("FLY CS=%04X IP=%04X prev=%04X:%04X AX=%04X BX=%04X CX=%04X DX=%04X FL=%04X\n",
                       cpu.cs, cpu.ip, last_cs, last_ip, cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.flags);
+            itrace_dump();   // ★ 回放真实执行过的最后若干步 + IP 漂移检测
             cpu_running = false;
             break;   // ★ 跳出 while，不 return
         }
@@ -595,6 +597,7 @@ static gboolean tick(gpointer data) {
                 emu_trace("LOOP CS=%04X IP=%04X byte=%02X %02X %02X AX=%04X BX=%04X CX=%04X DX=%04X FL=%04X\n",
                           cpu.cs, cpu.ip, cpu_mem_read(addr), cpu_mem_read(addr + 1),
                           cpu_mem_read(addr + 2), cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.flags);
+                itrace_dump();   // ★ 回放真实执行过的最后若干步 + IP 漂移检测
                 cpu_running = false;
                 break;   // ★ 跳出 while，不 return
             }

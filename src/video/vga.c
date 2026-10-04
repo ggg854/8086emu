@@ -3,7 +3,7 @@
 #include "cpu.h"
 #include "io.h"
 #include "font8x16.h"
-#include "vga_rom_ibm.h"
+#include "vga_rom_vga.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -15,6 +15,7 @@ uint8_t vga_planes[4][VGA_PLANE_SIZE] = {0};
 // VGA 端口寄存器
 uint8_t vga_seq_regs[8] = {0};
 uint8_t vga_gc_regs[16] = {0};
+uint8_t vga_crtc_regs[0x20] = {0};
 uint8_t vga_attr_regs[0x20] = {0};
 uint8_t vga_attr_palette[16] = {0, 1, 2, 3, 4, 5, 6, 7,
                                 8, 9, 10, 11, 12, 13, 14, 15};
@@ -420,11 +421,41 @@ void vga_cleanup(void) {
 }
 
 // ============================================================
+// 画布按需重建
+//   抽出来自 vga_set_mode，是因为 EGA/VGA 平面模式的分辨率要由 CRTC 动态推导
+//   （如 EGA 0x0D=320x200x16、0x10=640x350x16）——这些尺寸的调整发生在
+//   vga.mode 不变的情况下，必须能在不重设模式的前提下重算 stride。
+// ============================================================
+static void vga_ensure_canvas(int nw, int nh) {
+  if (vga.pixels && nw == vga.width && nh == vga.height) return;
+
+  if (vga.surface) { cairo_surface_destroy(vga.surface); vga.surface = NULL; }
+  if (vga.pixels)  { free(vga.pixels); vga.pixels = NULL; }
+
+  vga.width  = nw;
+  vga.height = nh;
+
+  if (!vga_headless) {
+    gtk_widget_set_size_request(vga.drawing_area, vga.width, vga.height + LED_BAR_H);
+    gtk_window_resize(GTK_WINDOW(vga.window), vga.width, vga.height + LED_BAR_H);
+  }
+
+  vga.pixels = malloc(vga.width * vga.height * sizeof(uint32_t));
+  memset(vga.pixels, 0, vga.width * vga.height * sizeof(uint32_t));
+
+  vga.surface = cairo_image_surface_create_for_data(
+    (unsigned char*)vga.pixels,
+    CAIRO_FORMAT_RGB24,
+    vga.width,
+    vga.height,
+    vga.width * sizeof(uint32_t));
+}
+
+// ============================================================
 // 模式切换
 // ============================================================
 void vga_set_mode(VideoMode mode) {
   vga.mode = mode;
-  if (debug_mode) fprintf(stderr, "[VGA] set_mode %d\n", mode);
 
   int nw = vga.width, nh = vga.height;
   switch (mode) {
@@ -441,29 +472,8 @@ void vga_set_mode(VideoMode mode) {
   //   CGA 的 320x200 与 640x200 都按 640x400 呈现；8088 MPH 之类演示常在同一帧里
   //   快速切模式（320↔640）做滚动/多色效果，若每次都重建 surface + resize 窗口，
   //   会严重闪屏。
-  bool dim_changed = (vga.pixels == NULL) || (nw != vga.width) || (nh != vga.height);
-  vga.width  = nw;
-  vga.height = nh;
-
-  if (dim_changed) {
-    if (vga.surface) cairo_surface_destroy(vga.surface);
-    if (vga.pixels) free(vga.pixels);
-
-    if (!vga_headless) {
-      gtk_widget_set_size_request(vga.drawing_area, vga.width, vga.height + LED_BAR_H);
-      gtk_window_resize(GTK_WINDOW(vga.window), vga.width, vga.height + LED_BAR_H);
-    }
-
-    vga.pixels = malloc(vga.width * vga.height * sizeof(uint32_t));
-    memset(vga.pixels, 0, vga.width * vga.height * sizeof(uint32_t));
-
-    vga.surface = cairo_image_surface_create_for_data(
-      (unsigned char*)vga.pixels,
-      CAIRO_FORMAT_RGB24,
-      vga.width,
-      vga.height,
-      vga.width * sizeof(uint32_t));
-  }
+  fprintf(stderr, "[VGA] set_mode %d -> %dx%d\n", (int)mode, nw, nh);
+  vga_ensure_canvas(nw, nh);
 
   vga.cursor_x = 0;
   vga.cursor_y = 0;
@@ -503,6 +513,69 @@ void vga_write_cga_color(uint8_t val) {
   // 记录逐扫描线阴影：写这一刻正在显示的扫描行用这个 0x3D9 值
   int ln = vga_current_scanline();
   if (ln >= 0 && ln < 200) { cga_line_color[ln] = val; cga_line_fid[ln] = cga_frame_id; }
+}
+
+// ============================================================
+// 从 VGA 寄存器推导视频模式
+//   客机显卡 ROM 接管 INT 10h 后直接写 Sequencer/GC/CRTC 寄存器进图形模式，
+//   本模拟器此前只在 init/reset/CGA 0x3D8 时切模式，导致 Windows 等直接写寄存器的
+//   程序一进图形模式就被渲染成文本（"退回文本模式"）。这里每次写 VGA 寄存器后重算模式。
+// ============================================================
+void vga_update_mode(void) {
+    // CGA 模式由 0x3D8 单独管理，CGA 上没有 GC；别被 GC[6] 误判成文本/图形
+    if (vga.mode == MODE_CGA_320x200 || vga.mode == MODE_CGA_640x200)
+        return;
+
+    uint8_t gc  = vga_gc_regs[6];        // GC Misc：bit0-1 = 内存映射选择
+    uint8_t seq = vga_seq_regs[4];       // Sequencer Memory Mode：bit0=chain4（256 色）
+    uint8_t mm  = gc & 0x03;             // 00/01=A0000(图形) 10=B0000(单色文本) 11=B8000(彩色文本)
+
+    if (mm >= 0x02) {                    // 文本模式（B0000 单色 / B8000 彩色）
+        // 列数以 CRTC 的 Horizontal Displayed（index 01）为准。VGA 上"每行字符数"
+        // 的权威来源是它，而不是 CGA 兼容口 0x3D8 的快照。
+        //   原先这里只判断"当前是否已是文本模式"，而把被误切成 40 列的
+        //   MODE_TEXT_40x25 也当作合法状态直接 return，于是只要有人往 0x3D8 写了
+        //   一个缺少 bit0 的值，就再也回不到 80 列 —— 表现为 Windows 2.03 之类
+        //   卡死在 40x25。
+        //   CRTC 未编程（0）或取值不合理时一律按 80 列，这是绝大多数文本软件的常态。
+        uint8_t hdisp = vga_crtc_regs[0x01];
+        VideoMode want = ((hdisp == 0) || (hdisp >= 60))
+                       ? MODE_TEXT_80x25 : MODE_TEXT_40x25;
+        if (vga.mode != want) {
+            
+            vga_set_mode(want);
+        }
+        return;
+    }
+    if (seq & 0x01) {                    // chain4 → 320x200x256
+        if (vga.mode != MODE_GFX_320x200) {
+            
+            vga_set_mode(MODE_GFX_320x200);
+        }
+        return;
+    }
+    // 位平面图形（EGA/VGA 16 色：640x480 / 640x350 / 640x400，以及 EGA 320x200）：
+    //   宽高一律由 CRTC 推导 —— 每个字符时钟 = 8 像素，故 宽度 = 水平显示字符数 * 8，
+    //   高度 = 垂直显示值 + 1。唯有如此才能区分 EGA 0x0D(320x200x16) 与
+    //   0x10(640x350x16)：原先写死 640 宽，会把 320 宽的模式按两倍拉伸并错行。
+    int vde = vga_crtc_regs[0x12]
+            | ((vga_crtc_regs[0x07] & 0x02) << 7)
+            | ((vga_crtc_regs[0x07] & 0x40) << 3);
+    int h = vde + 1;
+    if (h < 200) h = 200;
+    if (h > 480) h = 480;
+    if (vga.mode != MODE_GFX_640x480) {
+        
+        vga_set_mode(MODE_GFX_640x480);
+    }
+
+    int hdisp = vga_crtc_regs[0x01];
+    int w = (hdisp ? hdisp : 80) * 8;      // 未编程按 80 列（640 宽）兜底
+    if (w < 320) w = 320;
+    if (w > 720) w = 720;
+    vga_ensure_canvas(w, h);
+
+   
 }
 
 // CGA 4 色调色板：模式 4/5 用
@@ -603,8 +676,13 @@ static uint32_t comp_px(const uint8_t* idx, int w, int spp, int p) {
     return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 // ============================================================
-// VGA 位平面显存读写（模式 12h 用）
+// VGA 位平面显存读写（模式 12h 等平面模式用）
 // ============================================================
+// ★ 锁存寄存器（latch）：真实 EGA/VGA 每次 CPU 读平面显存都会把四个平面在该地址
+//   的内容锁存下来。写模式 1 以它为数据源 —— Windows 的位块传输、图形拷贝大量
+//   依赖这条路径。没有它，写模式 1 根本无法工作。
+static uint8_t vga_latch[4] = {0, 0, 0, 0};
+
 void vga_mem_write(uint32_t off, uint8_t val) {
     if (off >= VGA_PLANE_SIZE) return;
 
@@ -642,9 +720,10 @@ void vga_mem_write(uint32_t off, uint8_t val) {
                 }
                 break;
             }
-            case 1:     // 写模式 1：锁存器写
-                newb = (uint8_t)(old & bit_mask);
+            case 1: {   // 写模式 1：锁存器 → 目标（bit_mask 保护其余位不被清掉）
+                newb = (uint8_t)((old & ~bit_mask) | (vga_latch[p] & bit_mask));
                 break;
+            }
             case 2: {   // 写模式 2：位扩展
                 newb = 0;
                 for (int b = 0; b < 8; b++)
@@ -667,8 +746,31 @@ void vga_mem_write(uint32_t off, uint8_t val) {
 
 uint8_t vga_mem_read(uint32_t off) {
     if (off >= VGA_PLANE_SIZE) return 0xFF;
-    uint8_t read_map = vga_gc_regs[4] & 0x03;
-    return vga_planes[read_map][off];
+
+    // ★ CPU 每次读平面显存都会刷新四个锁存寄存器（写模式 1 的数据来源）
+    for (int p = 0; p < 4; p++) vga_latch[p] = vga_planes[p][off];
+
+    uint8_t read_mode = (vga_gc_regs[5] >> 3) & 0x01;   // GC reg5 bit3：读模式
+
+    if (!read_mode) {                       // 读模式 0：返回 Read Map Select 选中的平面
+        uint8_t read_map = vga_gc_regs[4] & 0x03;
+        return vga_planes[read_map][off];
+    }
+
+    // 读模式 1：颜色比较 —— 逐像素判断该点颜色是否等于 Color Compare，
+    //   Color Don't Care（reg7）里置 1 的位不参与比较。
+    //   每一位对应一个像素，比较相等则该位置 1（用于 pattern 填充类的软件检索）。
+    uint8_t cmp = vga_gc_regs[2] & 0x0F;    // Color Compare
+    uint8_t cdc = vga_gc_regs[7] & 0x0F;    // Color Don't Care
+    uint8_t cmp_mask = (uint8_t)((~cdc) & 0x0F);
+    uint8_t res = 0;
+    for (int b = 0; b < 8; b++) {
+        uint8_t pix = 0;
+        for (int p = 0; p < 4; p++)
+            pix |= (uint8_t)(((vga_latch[p] >> b) & 1) << p);
+        if (((pix ^ cmp) & cmp_mask) == 0) res |= (uint8_t)(1 << b);
+    }
+    return res;
 }
 // 在 VGA 屏幕正中心画一行字（黑底 #AAAAAA 前景）
 static void draw_centered_message(const char* msg) {
@@ -823,10 +925,11 @@ bool vga_render(void) {
         const uint8_t* p2 = vga_planes[2];
         const uint8_t* p3 = vga_planes[3];
 
-        for (int y = 0; y < 480; y++) {
+        int bytes_per_row = vga.width / 8;   // ★ 随 CRTC 推导出的实际宽度，不再写死 80
+        for (int y = 0; y < vga.height; y++) {
             uint32_t* dst = &px[y * W];
-            uint32_t base = (uint32_t)(y * 640) / 8;
-            for (int xb = 0; xb < 80; xb++) {
+            uint32_t base = (uint32_t)(y * vga.width) / 8;
+            for (int xb = 0; xb < bytes_per_row; xb++) {
                 uint32_t off = base + xb;
                 uint8_t b0 = p0[off], b1 = p1[off], b2 = p2[off], b3 = p3[off];
                 for (int bit = 7; bit >= 0; bit--) {
@@ -939,6 +1042,28 @@ bool vga_render(void) {
                 memcpy(&px[(dy + 1) * W], line, 640 * 4);
             }
             cairo_surface_mark_dirty(vga.surface);
+            // ★ 临时诊断（640x200 复合分支，定位后删除）——与末尾逻辑一致
+            {
+                static int diag_n6 = 0;
+                if (diag_n6 < 12) {
+                    diag_n6++;
+                    FILE* lf = fopen("vga_comp.log", diag_n6 == 1 ? "w" : "a");
+                    if (lf) {
+                        uint32_t total = W * (uint32_t)vga.height;
+                        long white = 0, color = 0;
+                        for (uint32_t i = 0; i < total; i++) {
+                            uint32_t c = px[i];
+                            int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+                            if (r > 250 && g > 250 && b > 250) white++;
+                            else if (!(r < 8 && g < 8 && b < 8)) color++;
+                        }
+                        fprintf(lf, "frame6-%2d mode=640 creg=0x%02X bw=%d white=%ld color=%ld total=%u (white%%=%ld color%%=%ld)\n",
+                                diag_n6, cga_color_reg, cga_bw, white, color, total,
+                                total ? white * 100 / total : 0, total ? color * 100 / total : 0);
+                        fclose(lf);
+                    }
+                }
+            }
             cga_frame_id++;
             return true;
         }
@@ -968,10 +1093,34 @@ bool vga_render(void) {
                 if (vga_planes[p][i] != 0) { all_zero = false; break; }
             }
         }
-        if (all_zero) draw_centered_message("Screen is not initizalied");
+        if (all_zero) draw_centered_message("Screen not initialized(yet).");
     }
 
     cairo_surface_mark_dirty(vga.surface);
+
+    // ★ 临时诊断：复合伪色白屏排查（定位后删除）
+    if (cga_composite) {
+        static int diag_n = 0;
+        if (diag_n < 12) {
+            diag_n++;
+            FILE* lf = fopen("vga_comp.log", diag_n == 1 ? "w" : "a");
+            if (lf) {
+                uint32_t total = W * (uint32_t)vga.height;
+                long white = 0, color = 0;
+                for (uint32_t i = 0; i < total; i++) {
+                    uint32_t c = px[i];
+                    int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+                    if (r > 250 && g > 250 && b > 250) white++;
+                    else if (!(r < 8 && g < 8 && b < 8)) color++;
+                }
+                fprintf(lf, "frame%-2d mode=%d creg=0x%02X bw=%d white=%ld color=%ld total=%u (white%%=%ld color%%=%ld)\n",
+                        diag_n, vga.mode, cga_color_reg, cga_bw, white, color, total,
+                        total ? white * 100 / total : 0, total ? color * 100 / total : 0);
+                fclose(lf);
+            }
+        }
+    }
+
     cga_frame_id++;
     return true;
 }
@@ -1003,8 +1152,9 @@ void vga_reset(void) {
 //   然后等显卡选件 ROM 来接管 —— 真机规矩。POST 的选件扫描（0x2a9 起）：
 //   从 C000 按 2KB 步长走，认偏移 0 的 0xAA55 签名、偏移 2 的长度（512 字节块）、
 //   以及全 ROM 字节累加为 0（校验例程 0x1a0f），通过就 lcall 段:0003。
-//   这里直接内嵌真 IBM VGA BIOS（见 vga_rom_ibm.h），不依赖外部文件、
-//   也不需要在启动时做任何选择：开机就是一台装好 IBM VGA 的机器。
+//   这里直接内嵌 Bochs LGPL VGA BIOS（见 vga_rom_vga.h），不依赖外部文件、
+//   也不需要在启动时做任何选择：开机就是一台装好标准 VGA 的机器。
+//   （原内嵌的 IBM 1986 ROM 被误判为 CGA、拒绝一切图形模式，故替换为通用 VGA BIOS。）
 // ============================================================
 #define VIDEO_ROM_SEG   0xC000
 #define VIDEO_ROM_ADDR  ((uint32_t)VIDEO_ROM_SEG << 4)
@@ -1012,8 +1162,9 @@ void vga_reset(void) {
 
 void vga_video_rom_install(void) {
   uint8_t* rom = &memory[VIDEO_ROM_ADDR];
-  // 前 0x2000 全 0（与原始 ROM 文件一致），24KB 选件 ROM 落在 C2000-C7FFF
+  // 标准 VGA BIOS（Bochs LGPL 0.9c）按装在 C0000 编译，长度恰为 0x8000，
+  // 直接整段搬入，无需偏移或前置填充。签名 55 AA、长度 64 块、校验和 0，POST 可识别。
   memset(rom, 0x00, VIDEO_ROM_SIZE);
-  memcpy(rom + VGA_ROM_IBM_OFFSET, vga_rom_ibm, VGA_ROM_IBM_SIZE);
+  memcpy(rom, vga_rom_vga, VGA_ROM_VGA_SIZE);
 }
 
