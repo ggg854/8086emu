@@ -693,6 +693,12 @@ void io_keyboard_poll(void) {
   //   有新字节（含键盘 BAT 0xAA）就投 IRQ1；下拍把 BAT 推送进队列。
   if (!cpu_is_286) {
     if (xt_kbd_reset_delay && --xt_kbd_reset_delay == 0) kbd_push_byte(0xAA);  // 复位脉冲后送 BAT
+    { static uint32_t hbn = 0;   // 心跳：看 CPU 究竟停在哪（诊断“无法输入”）
+      if ((hbn++ & 0x3FFF) == 0)
+        kbd_trace("[KBD] HB %04X:%04X pend=%d qlen=%d isr=%02X irr=%02X imr=%02X IF=%d\n",
+                  cpu.cs, cpu.ip, xt_kbd_irq_pending,
+                  (kbd_tail - kbd_head + KBD_BUF_SIZE) % KBD_BUF_SIZE,
+                  pic_m.isr, pic_m.irr, pic_m.imr, get_flag(FLAG_IF) ? 1 : 0); }
     if (kbd_has_data() && !xt_kbd_irq_pending) {
       bool msk = pic_irq_masked(1), ifl = get_flag(FLAG_IF),
            vi = vector_installed(pic_irq_vector(1));
