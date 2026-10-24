@@ -989,16 +989,19 @@ void cpu_execute_instruction(void) {
     uint32_t addr = cpu_seg_base(cpu.cs) + cpu.ip;
     uint8_t opcode = cpu_mem_read(addr);
 
-    // ★ 诊断：实模式下执行到 IVT 区域（线性 < 0x400）几乎必然是被当代码跑的数据。
+    // 低内存执行提示：PCXTBIOS 会在 IVT 区（如 0x3F6）用“栈上蹦床”合法执行代码——
+    //   PUSH 出指令字节 → RETF 跳过去执行 → 再 MOV SP,BP 恢复 SP。这并非跑飞，
+    //   因此仅首次警告、不停机，让指令继续执行（真正跑飞会以其它形式暴露）。
     if (!protect.pe) {
         uint32_t _lin = (uint32_t)(cpu.cs << 4) + cpu.ip;
         if (_lin < 0x400) {
-            fprintf(stderr, "[IVT-EXEC] entering IVT as code: CS:IP=%04X:%04X lin=%05X op=%02X  <- prev=%04X:%04X\n",
-                    cpu.cs, cpu.ip, _lin, opcode, dbg_prev_cs, dbg_prev_ip);
-            cpu_fault_dump("exec into IVT as code", 13, "ran off into the interrupt vector table");
-            fflush(stderr);
-            cpu_running = false;
-            return;
+            static int ivt_warned = 0;
+            if (!ivt_warned) {
+                ivt_warned = 1;
+                fprintf(stderr, "[IVT-EXEC] low-mem exec CS:IP=%04X:%04X lin=%05X op=%02X <- prev=%04X:%04X (trampoline, continuing)\n",
+                        cpu.cs, cpu.ip, _lin, opcode, dbg_prev_cs, dbg_prev_ip);
+                fflush(stderr);
+            }
         }
     }
     dbg_prev_cs = cpu.cs; dbg_prev_ip = cpu.ip;   // 记录本条入口，供下一条/故障定位来源
