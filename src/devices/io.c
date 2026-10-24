@@ -1,6 +1,7 @@
 // io.c - I/O 端口 + 定时器 + 键盘（完整 8042）
 #include "io.h"
 #include "cpu.h"
+#include "bus.h"
 #include "ide.h"
 #include "vga.h"
 #include "protect.h"
@@ -1077,7 +1078,19 @@ static FILE* iotr_open(void) {
   if (!f) f = fopen("iotrace_port.log", "w");
   return f;
 }
+// ============================================================
+// I/O 端口读写（经总线 Bus 分发）
+//   CPU 只调用 io_read_port / io_write_port（内部转总线）。
+//   下面 legacy_read / legacy_write 承载原有全部端口分发逻辑，作为挂在
+//   总线上的「legacy-io」设备；后续把 IDE/DMA/FDC/PIT/PIC 拆成独立设备后，
+//   这个 legacy 设备会逐步瘦身直至消失，而 io_read_port 入口保持不变。
+// ============================================================
 uint8_t io_read_port(uint16_t port) {
+  return bus_read_port(bus_get_global(), port);
+}
+
+static uint8_t legacy_read(void* ctx, uint16_t port) {
+  (void)ctx;
   uint8_t ret = 0;
   // ★ 诊断 IOTRACE：打印嫌疑端口（DMA/PIT/键盘）的读，定位 XT BIOS 卡死。事后删。
   static int g_iotr = -1;
@@ -1347,9 +1360,15 @@ uint8_t io_read_port(uint16_t port) {
 }
 
 // ============================================================
-// 写端口
+// ============================================================
+// 写端口（经总线 Bus 分发）
 // ============================================================
 void io_write_port(uint16_t port, uint8_t val) {
+  bus_write_port(bus_get_global(), port, val);
+}
+
+static void legacy_write(void* ctx, uint16_t port, uint8_t val) {
+  (void)ctx;
   // ★ 诊断 IOTRACE（与读共用开关）
   static int g_iotw = -1;
   if (g_iotw < 0) g_iotw = getenv("IOTRACE") ? 1 : 0;
@@ -1758,6 +1777,9 @@ int vga_current_scanline(void) {
 //   客机一上电看到的 CMOS 是全 0 —— 其中 0x12 固定盘类型也是 0，硬盘自然不认）。
 __attribute__((constructor))
 static void io_init_constructor(void) {
+  // 把本文件的端口分发逻辑作为「legacy-io」设备挂到总线上（覆盖全部 64K 端口）。
+  // 后续拆分出独立设备（IDE/DMA/FDC/PIT/PIC…）后，各自注册到总线，本 legacy 设备瘦身。
+  bus_register(bus_get_global(), "legacy-io", NULL, legacy_read, legacy_write, 0x0000, 0x10000);
   bool ok = cmos_load();
   // 掉电/失效标志：0x0D bit7 = 0 表示"电池没电、RAM 与时间无效"。真机没电就要重配，
   // 这里同理 —— 旧会话留下的镜像若带这个标志（或干脆读不出），重建一套有效配置，
