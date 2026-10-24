@@ -6,7 +6,7 @@
   "cpu_mhz":20,
   "ram_mb":4,
   "composite":false,
-  "font":"cga",
+  "font":"vga",
   "console":false,
   "debug":false
 }

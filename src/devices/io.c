@@ -431,7 +431,10 @@ static void uart_write_reg(uint16_t port, uint8_t v) {
 // 主机侧键盘输入（GTK 事件 → 设备队列）
 // ============================================================
 void io_keyboard_push(uint8_t scancode) {
-  if (!kbd_enabled_now()) return;       // 扫描被 0xF5 或命令字节 bit4 禁止
+  static int ktr = -1; if (ktr < 0) ktr = getenv("KBDTRACE") ? 1 : 0;
+  bool en = kbd_enabled_now();
+  if (ktr) fprintf(stderr, "[KBD] push %02X enabled=%d is286=%d\n", scancode, en, cpu_is_286);
+  if (!en) return;       // 扫描被 0xF5 或命令字节 bit4 禁止
   kbd_push_byte(scancode);
   vga_led_activity(3);              // 键盘读写灯：按一下就闪
   // 锁定键：真实键盘自己翻转锁定状态（松开键还会再发一次 0x80|x，这里只认按下）
@@ -680,11 +683,18 @@ void io_keyboard_poll(void) {
   if (!cpu_is_286) {
     if (xt_kbd_reset_delay && --xt_kbd_reset_delay == 0) kbd_push_byte(0xAA);  // 复位脉冲后送 BAT
     if (kbd_has_data() && !xt_kbd_irq_pending) {
-      if (!pic_irq_masked(1) && get_flag(FLAG_IF) &&
-          vector_installed(pic_irq_vector(1))) {
+      static int ktr = -1; if (ktr < 0) ktr = getenv("KBDTRACE") ? 1 : 0;
+      bool msk = pic_irq_masked(1), ifl = get_flag(FLAG_IF),
+           vi = vector_installed(pic_irq_vector(1));
+      if (!msk && ifl && vi) {
         xt_kbd_irq_pending = true;
         pic_ack(1);
         cpu_interrupt(pic_irq_vector(1));
+        if (ktr) fprintf(stderr, "[KBD] IRQ1 -> INT %02X\n", pic_irq_vector(1));
+      } else if (ktr) {
+        fprintf(stderr, "[KBD] IRQ1 blocked: masked=%d IF=%d vec_inst=%d vec=%02X qlen=%d\n",
+                msk, ifl, vi, pic_irq_vector(1),
+                (kbd_tail - kbd_head + KBD_BUF_SIZE) % KBD_BUF_SIZE);
       }
     }
     return;
@@ -1162,12 +1172,17 @@ static uint8_t legacy_read(void* ctx, uint16_t port) {
     // ---- 0x60：XT 是 8255 PPI 端口 A（键盘数据）/ AT 是 8042 输出缓冲 ----
     case 0x60: {
       if (!cpu_is_286) {
-        // XT：从设备队列取扫描码（键盘 BAT 0xAA、用户输入都在这里）
+        // XT：从设备队列取一个扫描码。每读走一个就释放本次 IRQ1 —— XT 键盘一次中断
+        // 只对应一个扫描码；若队列里还有（如“按下+松开”或连续按键），io_keyboard_poll
+        // 会再投下一次 IRQ1。以前只在“读空”时才清 pending，会导致第 2 个及以后的扫描码
+        // 永远卡在队列里 → 表现为无法输入。
         if (kbd_head != kbd_tail) {
           xt_kbd_last = kbd_pop_byte();
-          if (kbd_head == kbd_tail) xt_kbd_irq_pending = false;  // 队空：可再投下一字节
         }
+        xt_kbd_irq_pending = false;
         ret = xt_kbd_last;
+        { static int ktr = -1; if (ktr < 0) ktr = getenv("KBDTRACE") ? 1 : 0;
+          if (ktr) fprintf(stderr, "[KBD] read 0x60 -> %02X\n", ret); }
       } else {
         ret = kbd_out_buf;
         kbd_out_full = false;
