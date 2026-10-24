@@ -11,6 +11,15 @@ iotrace_port.log
 boot_trace.log
 vga_*.log
 run_*.ps1
-
+*.ps1
+*.log
+*.rom
+*.txt
+*.bin
+*.img
+*.iso
+*.asm
+*.json
+*.bat
 # 大磁盘镜像（用户数据，不入仓；本地保留即可）
 data/dos.img

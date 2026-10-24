@@ -1709,6 +1709,13 @@ void io_write_port16(uint16_t port, uint16_t val) {
   io_write_port(port + 1, val >> 8);
 }
 
+// 把本文件的端口分发逻辑作为「legacy-io」设备挂到总线（覆盖全部 64K 端口）。
+// 由 machine/pc.c 装配，且必须最先注册，后续独立设备（DMA/IDE/PIT/PIC…）后注册即可
+// 覆盖对应区间，legacy 设备随之逐步瘦身。
+void io_register_bus(Bus* bus) {
+  bus_register(bus, "legacy-io", NULL, legacy_read, legacy_write, 0x0000, 0x10000);
+}
+
 // ============================================================
 // 机器复位（GTK「重启」按钮）：清键盘/PIC/PIT/PPI 状态。
 // 客机内存已被清空、BIOS 会重新 POST，所以这里只需回到上电默认值。
@@ -1777,9 +1784,6 @@ int vga_current_scanline(void) {
 //   客机一上电看到的 CMOS 是全 0 —— 其中 0x12 固定盘类型也是 0，硬盘自然不认）。
 __attribute__((constructor))
 static void io_init_constructor(void) {
-  // 把本文件的端口分发逻辑作为「legacy-io」设备挂到总线上（覆盖全部 64K 端口）。
-  // 后续拆分出独立设备（IDE/DMA/FDC/PIT/PIC…）后，各自注册到总线，本 legacy 设备瘦身。
-  bus_register(bus_get_global(), "legacy-io", NULL, legacy_read, legacy_write, 0x0000, 0x10000);
   bool ok = cmos_load();
   // 掉电/失效标志：0x0D bit7 = 0 表示"电池没电、RAM 与时间无效"。真机没电就要重配，
   // 这里同理 —— 旧会话留下的镜像若带这个标志（或干脆读不出），重建一套有效配置，

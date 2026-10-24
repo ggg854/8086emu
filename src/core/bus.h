@@ -33,6 +33,9 @@ void bus_register(Bus *bus, const char *name, void *ctx,
 /* 未命中任何设备时的默认处理（通常读返回 0xFF / 写忽略）。 */
 void bus_set_default(Bus *bus, bus_read_fn rd, bus_write_fn wr, void *ctx);
 
+/* 清空总线（设备表 + 默认处理）。机器重启/重新装配前调用，保证注册幂等。 */
+void bus_reset(Bus *bus);
+
 uint8_t bus_read_port(Bus *bus, uint16_t port);
 void    bus_write_port(Bus *bus, uint16_t port, uint8_t val);
 

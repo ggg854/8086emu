@@ -5,8 +5,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+typedef struct Bus Bus;   // 前向声明（core/bus.h）
+
 uint8_t dma_read_port(uint16_t port);
 void    dma_write_port(uint16_t port, uint8_t val);
+
+// 把 8237 DMA 挂到总线（端口 0x00-0x0F / 0x80-0x8F / 0xC0-0xDF）。由 machine 层装配。
+void     dma_register_bus(Bus* bus);
 
 // ---- 供 FDC 等设备使用 ----
 uint32_t dma_phys_addr(int ch);      // 20 位物理地址（页 << 16 | 当前地址）

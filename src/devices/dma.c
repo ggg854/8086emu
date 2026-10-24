@@ -4,6 +4,7 @@
 //         寄存器都是 16 位单元（地址/计数以字为单位）。
 //   对外沿用主片接口（FDC 用通道 2）；从片只保证寄存器读写语义完整。
 #include "dma.h"
+#include "bus.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -224,6 +225,16 @@ void dma_reset(void) {
   for (int i = 0; i < 4; i++) { dma_m.page[i] = 0; dma_s.page[i] = 0; }
   memset(dma_page_spare, 0, sizeof(dma_page_spare));
   dma_s.is16 = true;
+}
+
+// ---- 挂到总线：8237 作为独立设备（由 machine/pc.c 按序装配，须晚于 legacy 设备）----
+static uint8_t dma_bus_read(void* ctx, uint16_t port)  { (void)ctx; return dma_read_port(port); }
+static void    dma_bus_write(void* ctx, uint16_t port, uint8_t val) { (void)ctx; dma_write_port(port, val); }
+
+void dma_register_bus(Bus* bus) {
+  bus_register(bus, "dma",       NULL, dma_bus_read, dma_bus_write, 0x00, 0x10);  // 0x00-0x0F 主片寄存器
+  bus_register(bus, "dma-page",  NULL, dma_bus_read, dma_bus_write, 0x80, 0x10);  // 0x80-0x8F 页寄存器
+  bus_register(bus, "dma-slave", NULL, dma_bus_read, dma_bus_write, 0xC0, 0x20);  // 0xC0-0xDF 从片寄存器+页寄存器
 }
 // ============================================================
 

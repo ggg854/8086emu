@@ -19,6 +19,7 @@ SRCS = \
 	src/core/protect.c \
 	src/core/fpu.c \
 	src/core/bus.c \
+	src/machine/pc.c \
 	src/devices/io.c \
 	src/devices/ide.c \
 	src/devices/dma.c \

@@ -5,10 +5,16 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+typedef struct Bus Bus;   // 前向声明（core/bus.h）
+
 uint8_t  io_read_port(uint16_t port);
 void     io_write_port(uint16_t port, uint8_t val);
 uint16_t io_read_port16(uint16_t port);
 void     io_write_port16(uint16_t port, uint16_t val);
+
+// 把 I/O 分发逻辑作为「legacy-io」设备挂到总线。由 machine/pc.c 最先调用，
+// 之后具体设备再各自注册覆盖对应端口区间。
+void     io_register_bus(Bus* bus);
 
 void io_keyboard_push(uint8_t scancode);
 void io_keyboard_push_release(uint8_t scancode);

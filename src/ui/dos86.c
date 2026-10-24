@@ -6,6 +6,7 @@
 #include "io.h"
 #include "dma.h"
 #include "fdc.h"
+#include "pc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -930,6 +931,8 @@ void init_emulator(const Config* cfg) {
     memory_size = ram;
 
     cpu_init();
+
+    machine_io_init();   // 装配 I/O 设备到总线（须早于 CPU 取指）
 
     if (cfg->console) vga_set_headless(true);
     vga_init(0, NULL);   // 注意：gtk_init 已经在 main 里调了

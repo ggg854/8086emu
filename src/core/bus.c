@@ -45,6 +45,13 @@ void bus_set_default(Bus *bus, bus_read_fn rd, bus_write_fn wr, void *ctx) {
     bus->def_ctx = ctx;
 }
 
+void bus_reset(Bus *bus) {
+    bus->ndevs = 0;
+    bus->def_rd = NULL;
+    bus->def_wr = NULL;
+    bus->def_ctx = NULL;
+}
+
 uint8_t bus_read_port(Bus *bus, uint16_t port) {
     /* 后注册者优先：从表尾向前找第一个覆盖该端口的设备。 */
     for (int i = bus->ndevs - 1; i >= 0; i--) {
