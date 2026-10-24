@@ -701,6 +701,14 @@ void io_keyboard_poll(void) {
         pic_ack(1);
         cpu_interrupt(pic_irq_vector(1));
         kbd_trace("[KBD] IRQ1 -> INT %02X\n", pic_irq_vector(1));
+        if (pic_irq_vector(1) == 9) {
+          uint16_t ho = (uint16_t)(cpu_mem_read(0x24) | (cpu_mem_read(0x25) << 8));
+          uint16_t hs = (uint16_t)(cpu_mem_read(0x26) | (cpu_mem_read(0x27) << 8));
+          uint32_t hl = (uint32_t)hs * 16u + ho;
+          kbd_trace("[KBD] INT09 handler=%04X:%04X bytes=%02X %02X %02X %02X\n",
+                    hs, ho, cpu_mem_read(hl), cpu_mem_read(hl + 1),
+                    cpu_mem_read(hl + 2), cpu_mem_read(hl + 3));
+        }
       } else {
         static int blocked_logged = 0;   // 只记第一次阻塞原因，避免每 poll 都写
         if (!blocked_logged) {
