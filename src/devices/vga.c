@@ -30,6 +30,7 @@ static int vga_plane_stride = 80;
 //   文本渲染按 16 行/字符走；选 CGA 时把 8x8 字形放到每个单元格的上 8 行（下 8 行留空）。
 //   与 src/xt 驱动的 CGA/VGA 二选一概念一致，由 config 的 font 字段驱动。
 static int vga_font_cga = 0;
+static int vga_char_h   = 16;   // 字符单元格高度：VGA=16、CGA=8（各自原生，不放大）
 
 static void vga_apply_font(void) {
   init_font();                         // 默认：VGA 8x16
@@ -37,13 +38,15 @@ static void vga_apply_font(void) {
     memset(font8x16, 0, sizeof(font8x16));
     for (int c = 0; c < 256; c++)
       for (int i = 0; i < 8; i++)
-        font8x16[c][i] = cga_font_8x8[c * 8 + i];   // CGA 8x8 → 上 8 行
+        font8x16[c][i] = cga_font_8x8[c * 8 + i];   // CGA 8x8 原生（占 rows 0-7）
   }
 }
 
 void vga_set_font_cga(int on) {
   vga_font_cga = on ? 1 : 0;
+  vga_char_h   = on ? 8 : 16;
   vga_apply_font();
+  vga_set_mode(vga.mode);   // 文本画布高度 = 25*char_h，按字库重算（CGA=200、VGA=400）
 }
 
 // VGA 端口寄存器
@@ -520,8 +523,8 @@ void vga_set_mode(VideoMode mode) {
 
   int nw = vga.width, nh = vga.height;
   switch (mode) {
-    case MODE_TEXT_80x25: nw = 640; nh = 400; break;
-    case MODE_TEXT_40x25: nw = 320; nh = 400; break;
+    case MODE_TEXT_80x25: nw = 640; nh = 25 * vga_char_h; break;   // CGA 字库=200 行、VGA=400 行
+    case MODE_TEXT_40x25: nw = 320; nh = 25 * vga_char_h; break;
     case MODE_GFX_640x480: nw = 640; nh = 480; break;
     case MODE_GFX_320x200: nw = 320; nh = 200; break;
     // CGA 图形：内部按 640x400 呈现（横向/纵向各放大一倍，保持 4:3 比例）
@@ -1047,8 +1050,8 @@ bool vga_render(void) {
                     uint32_t fg32 = (fgc.r << 16) | (fgc.g << 8) | fgc.b;
                     uint32_t bg32 = (bgc.r << 16) | (bgc.g << 8) | bgc.b;
                     const uint8_t* font = font8x16[ch];
-                    int px0 = col * 8, py = row * 16;
-                    for (int y = 0; y < 16; y++) {
+                    int px0 = col * 8, py = row * vga_char_h;
+                    for (int y = 0; y < vga_char_h; y++) {
                         uint8_t bits = font[y];
                         uint32_t* dst = &px[(py + y) * W + px0];
                         for (int x = 0; x < 8; x++)
@@ -1064,8 +1067,8 @@ bool vga_render(void) {
         if (!(memory[0x460] & 0x20) && cx < cols && cy < 25) {
             gint64 now = g_get_monotonic_time();
             if (((now / 500000) % 2) == 0) {
-                int px0 = cx * 8, py = cy * 16;
-                for (int y = 14; y <= 15; y++) {
+                int px0 = cx * 8, py = cy * vga_char_h;
+                for (int y = vga_char_h - 2; y < vga_char_h; y++) {
                     uint32_t* dst = &px[(py + y) * W + px0];
                     for (int x = 0; x < 8; x++) dst[x] = 0xAAAAAA;
                 }
