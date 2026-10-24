@@ -588,7 +588,6 @@ static gboolean tick(gpointer data) {
             }
             emu_trace("FLY CS=%04X IP=%04X prev=%04X:%04X AX=%04X BX=%04X CX=%04X DX=%04X FL=%04X\n",
                       cpu.cs, cpu.ip, last_cs, last_ip, cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.flags);
-            itrace_dump();   // ★ 回放真实执行过的最后若干步 + IP 漂移检测
             cpu_running = false;
             break;   // ★ 跳出 while，不 return
         }
@@ -612,7 +611,6 @@ static gboolean tick(gpointer data) {
                 emu_trace("LOOP CS=%04X IP=%04X byte=%02X %02X %02X AX=%04X BX=%04X CX=%04X DX=%04X FL=%04X\n",
                           cpu.cs, cpu.ip, cpu_mem_read(addr), cpu_mem_read(addr + 1),
                           cpu_mem_read(addr + 2), cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.flags);
-                itrace_dump();   // ★ 回放真实执行过的最后若干步 + IP 漂移检测
                 cpu_running = false;
                 break;   // ★ 跳出 while，不 return
             }
@@ -657,21 +655,21 @@ static gboolean tick(gpointer data) {
         {
             static int hb_on = -1;
             static uint64_t hb_cnt = 0;
-            static int hb_last_span = -1;
+            static uint16_t hb_last_cs = 0, hb_last_ip = 0;
             static bool hb_have = false;
             if (hb_on < 0) hb_on = getenv("HEARTBEAT") ? 1 : 0;
             if (hb_on && ((hb_cnt++ & 0x1FFFFF) == 0)) {
-                int span = itrace_pc_span();
-                fprintf(stderr, "[HB] CS=%04X IP=%04X AX=%04X CX=%04X DX=%04X span=%d\n",
-                        cpu.cs, cpu.ip, cpu.ax, cpu.cx, cpu.dx, span);
-                if (hb_have && span >= 0 && span < 4096 && hb_last_span >= 0 && hb_last_span < 4096) {
-                    fprintf(stderr, "[HB-STUCK] PC stuck in <4KB loop across 2M instructions: CS:IP=%04X:%04X span=%d\n",
-                            cpu.cs, cpu.ip, span);
-                    itrace_dump();
+                fprintf(stderr, "[HB] CS=%04X IP=%04X AX=%04X CX=%04X DX=%04X\n",
+                        cpu.cs, cpu.ip, cpu.ax, cpu.cx, cpu.dx);
+                // PC 连续两次心跳不变 → 判定卡死，dump 完整现场并停机
+                if (hb_have && hb_last_cs == cpu.cs && hb_last_ip == cpu.ip) {
+                    fprintf(stderr, "[HB-STUCK] PC unchanged across heartbeats: CS:IP=%04X:%04X\n",
+                            cpu.cs, cpu.ip);
+                    cpu_fault_dump("stuck (PC unchanged)", 8, "heartbeat stuck detection");
                     fflush(stderr);
                     cpu_running = false;
                 }
-                hb_last_span = span; hb_have = true;
+                hb_last_cs = cpu.cs; hb_last_ip = cpu.ip; hb_have = true;
             }
         }
         if (!cpu_prefix_step) io_timer_poll();

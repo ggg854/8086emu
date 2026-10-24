@@ -981,212 +981,17 @@ static bool cpu386_exec_operand32(uint8_t op) {
 
 // 主译码循环
 // ============================================================
-// ============================================================
-// ★ 临时诊断：最近若干条指令的 CS:IP(+操作码) 环形缓冲
-//   用途：客机跑飞到数据区报 invalid opcode 时，回溯"它是从哪一步开始跑偏的"。
-//   （定位后删）
-// ============================================================
-#define ITRACE_N 2048
-static uint16_t itr_cs[ITRACE_N], itr_ip[ITRACE_N];
-static uint8_t  itr_op[ITRACE_N];
-static uint8_t  itr_op2[ITRACE_N];   // 紧跟 opcode 的字节（取 ModR/M，判定 GRP5 控制流）
-static uint8_t  itr_len[ITRACE_N];   // 本条指令真实推进的 IP 长度（执行尾部填）
-static bool     itr_brk[ITRACE_N];   // 本条之后可能不是紧邻的下一条（循环限流跳过时置位）
-static int      itr_n = 0;
-static int      itr_count = 0;       // 环内有效条目数（上限 ITRACE_N）
-static bool     itr_have = false;
-static int      itr_slot_cur = -1;   // 当前这条指令在环内的槽位（-1 = 未记条目）
-
-// ★ 循环限流：短循环（如 1923/1925/1927 三元组）会把同一批地址反复推进环形缓冲，
-//   把"进循环之前究竟从哪来"整段挤掉，是最难排查的情况。
-//   限制同一地址在最近窗口内最多出现 ITR_MAX_DUP 次即可保住循环之前的历史。
-#define ITR_MAX_DUP 2
-#define ITR_WIN     512
-
-// 控制流指令：IP 推进 ≠ 指令长度，回放比对时跳过
-static bool itr_is_cflow(uint8_t op, uint8_t op2) {
-    if ((op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3) ||
-        op == 0xEB || op == 0xE9 || op == 0xEA || op == 0xE8 || op == 0x9A ||
-        op == 0xC3 || op == 0xC2 || op == 0xCB || op == 0xCA ||
-        op == 0xCC || op == 0xCE || op == 0xCD || op == 0xCF) return true;
-    if (op == 0xFF) { int r = (op2 >> 3) & 7; if (r >= 2 && r <= 5) return true; }
-    return false;
-}
-
-// 返回本次写入的环内槽位；若与上一条地址相同（REP 重复）则未写，返回 -1。
-static int itrace_push(uint16_t cs, uint16_t ip, uint8_t op, uint8_t op2) {
-    // REP 会递归调用本函数、同一地址连打上百次；只记"发生变化"的项，
-    // 否则一次 rep 就能把环形缓冲刷成 256 条同一个地址。
-    if (itr_have) {
-        int prev = (itr_n - 1 + ITRACE_N) % ITRACE_N;
-        if (itr_cs[prev] == cs && itr_ip[prev] == ip) return -1;
-        // 同一地址在最近 ITR_WIN 条里出现得太频繁 = 正在打循环，抑制记录。
-        // 否则本次崩溃那种三元组循环会把 256 条全刷成它，看不出从哪进来的。
-        int avail = itr_count - 1;                       // prev 之前还有多少条可回溯
-        int win = (avail < ITR_WIN) ? avail : ITR_WIN;
-        int cnt = 0;
-        for (int k = 1; k <= win; k++) {
-            int idx = (prev - k + ITRACE_N) % ITRACE_N;
-            if (itr_cs[idx] == cs && itr_ip[idx] == ip) cnt++;
-        }
-        if (cnt >= ITR_MAX_DUP) {
-            itr_brk[prev] = true;   // prev 的下一条不再是紧邻步骤，漂移检测要跳过这一对
-            return -1;
-        }
-    }
-    int slot = itr_n;
-    itr_cs[slot] = cs; itr_ip[slot] = ip; itr_op[slot] = op; itr_op2[slot] = op2;
-    itr_len[slot] = 0;
-    itr_brk[slot] = false;
-    itr_n = (itr_n + 1) % ITRACE_N;
-    if (itr_count < ITRACE_N) itr_count++;
-    itr_have = true;
-    return slot;
-}
-
-// 导出给 dos86.c：崩溃 / 跑飞时回放真实执行过的最后若干步。
-void itrace_dump(void) {
-    if (!itr_have) return;
-    fprintf(stderr, "[FAULT] ---- last %d executed steps (oldest -> newest) ----\n", ITRACE_N);
-    for (int k = 0; k < ITRACE_N; k += 4) {
-        fprintf(stderr, "[TRACE]");
-        for (int j = 0; j < 4 && (k + j) < ITRACE_N; j++) {
-            int i = (itr_n + k + j) % ITRACE_N;
-            fprintf(stderr, "  %04X:%04X(%02X,L%u)",
-                    itr_cs[i], itr_ip[i], itr_op[i], (unsigned)itr_len[i]);
-        }
-        fprintf(stderr, "\n");
-    }
-    // ★ IP 漂移检测：相邻两步若同段且非控制流，必须满足
-    //   下一条 IP == 本条 IP + 本条真实推进长度。
-    //   违反 = 该步解码长度算错（典型是少算 1 字节 → 之后持续 +1 错位 → 跑飞）。
-    //   全部基于环形缓冲里记录的真实 IP / 长度，不读内存 → 不受重定位干扰。
-    for (int k = 0; k + 1 < itr_count; k++) {
-        int i  = (itr_n + k) % ITRACE_N;
-        int n2 = (itr_n + k + 1) % ITRACE_N;
-        if (itr_cs[i] != itr_cs[n2]) continue;   // 跨段（远调用/中断返回）不算
-        if (itr_brk[i]) continue;                // 中间有指令被循环限流跳过，二者并非紧邻步骤
-        // itr_len==0 表示控制流（IP 跳转合法）或未记录，跳过；前缀步的长度就是 1，同样适用
-        if (itr_len[i] == 0) continue;
-        uint16_t gap = (uint16_t)(itr_ip[n2] - itr_ip[i]);
-        if (gap != (uint16_t)itr_len[i])
-            fprintf(stderr, "[DRIFT] #%d %04X:%04X op %02X len=%u -> next %04X (gap %u)\n",
-                    k, itr_cs[i], itr_ip[i], itr_op[i], (unsigned)itr_len[i], itr_ip[n2], gap);
-    }
-    fflush(stderr);
-}
-
-// ★ 参考解码：返回 286 指令长度（含前缀）。无法判定返回 -1（跳过比对，防误报）。
-//   用于与模拟器实际 IP 推进对比，抓出"指令长度算错"导致的 IP 漂移。
-static int insn_len_286(uint32_t lin) {
-    uint8_t b = cpu_mem_read(lin);
-    int off = 1;
-    for (;;) {
-        if (b == 0x26 || b == 0x2E || b == 0x36 || b == 0x3E || b == 0xF0 ||
-            b == 0x66 || b == 0x67) {        // 286 下 66/67 视为 1 字节未定义
-            b = cpu_mem_read(lin + off); off++;
-            if (off > 6) return -1;
-            continue;
-        }
-        break;
-    }
-    if (b == 0x0F) {
-        uint8_t sub = cpu_mem_read(lin + off + 1);
-        uint8_t m = cpu_mem_read(lin + off + 2);
-        int mod = (m >> 6) & 3, rm = m & 7;
-        int ml = (mod == 0 && rm == 6) ? 2 : (mod == 1 ? 1 : (mod == 2 ? 2 : 0));
-        if (sub >= 0x04 && sub <= 0x0B) return off + 2;  // LOADALL/SMSW 类 286 专用
-        return off + 2 + ml;                              // 0F 00..03 + modrm + disp
-    }
-    uint8_t m = cpu_mem_read(lin + off);
-    int mod = (m >> 6) & 3, rm = m & 7;
-    int ml = (mod == 0 && rm == 6) ? 2 : (mod == 1 ? 1 : (mod == 2 ? 2 : 0));
-    int L = off + 1;                 // 到 modrm 字节为止
-    int ML = L + ml;                 // 含 modrm + disp
-    switch (b) {
-        // 无 modrm 单字节
-        case 0x06: case 0x07: case 0x0E: case 0x16: case 0x17: case 0x1E: case 0x1F:
-        case 0x27: case 0x2F: case 0x37: case 0x3F:
-        case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47:
-        case 0x48: case 0x49: case 0x4A: case 0x4B: case 0x4C: case 0x4D: case 0x4E: case 0x4F:
-        case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57:
-        case 0x58: case 0x59: case 0x5A: case 0x5B: case 0x5C: case 0x5D: case 0x5E: case 0x5F:
-        case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97:
-        case 0x98: case 0x99: case 0x9C: case 0x9D: case 0x9E: case 0x9F:
-        case 0xC3: case 0xC9: case 0xCB: case 0xCC: case 0xCE:
-        case 0xF1: case 0xF8: case 0xF9: case 0xFA: case 0xFB: case 0xFC: case 0xFD:
-            return L;
-        // imm8（紧跟 opcode）
-        case 0x04: case 0x0C: case 0x14: case 0x1C: case 0x24: case 0x2C: case 0x34: case 0x3C:
-        case 0x6A: case 0x6B:
-        case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76:
-        case 0x77: case 0x78: case 0x79: case 0x7A: case 0x7B: case 0x7C: case 0x7D: case 0x7E: case 0x7F:
-        case 0xA0: case 0xA2: case 0xB0: case 0xB1: case 0xC2: case 0xCA:
-        case 0xCD: case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6: case 0xE7:
-            return L + 1;
-        // imm16（紧跟 opcode）
-        case 0x05: case 0x0D: case 0x15: case 0x1D: case 0x25: case 0x2D: case 0x35: case 0x3D:
-        case 0x68: case 0xA1: case 0xA3: case 0xA9: case 0xB8: case 0xB9: case 0xBA: case 0xBB:
-        case 0xBC: case 0xBD: case 0xBE: case 0xBF: case 0xE8: case 0xE9:
-            return L + 2;
-        // ALU r/m 形式（modrm）
-        case 0x00: case 0x01: case 0x02: case 0x03: case 0x08: case 0x09: case 0x0A: case 0x0B:
-        case 0x10: case 0x11: case 0x12: case 0x13: case 0x18: case 0x19: case 0x1A: case 0x1B:
-        case 0x20: case 0x21: case 0x22: case 0x23:
-        case 0x28: case 0x29: case 0x2A: case 0x2B:
-        case 0x30: case 0x31: case 0x32: case 0x33:
-        case 0x38: case 0x39: case 0x3A: case 0x3B:
-        case 0x84: case 0x85: case 0x86: case 0x87: case 0x88: case 0x89:
-        case 0x8A: case 0x8B: case 0x8C: case 0x8D: case 0x8E: case 0x8F:
-            return ML;
-        case 0x80: case 0x82: return ML + 1;          // GRP1 r/m8, imm8
-        case 0x81: case 0x83: return ML + 2;          // GRP1 r/m16, imm16/imm8(sx)
-        case 0xC0: case 0xC1: return ML + 1;          // GRP2 r/m8, imm8
-        case 0xD0: case 0xD1: return ML;              // GRP2 r/m, 1
-        case 0xD2: case 0xD3: return ML;              // GRP2 r/m, CL
-        case 0xC4: case 0xC5: return ML + 2;          // LES/LDS r16, m16:16
-        case 0xC6: return ML + 1;                     // MOV r/m8, imm8
-        case 0xC7: return ML + 2;                     // MOV r/m16, imm16
-        case 0x69: return ML + 2;                     // IMUL r16, r/m16, imm16
-        case 0x9A: case 0xEA: return L + 4;           // CALL/JMP FAR
-        case 0xF6: { int r = (m >> 3) & 7; return (r == 0) ? ML + 1 : ML; }  // GRP3
-        case 0xF7: { int r = (m >> 3) & 7; return (r == 0) ? ML + 2 : ML; }  // GRP4
-        case 0xFE: return ML;                         // GRP5a
-        case 0xFF: return ML;                         // GRP5b
-        case 0xD4: case 0xD5: return L + 1;          // AAM/AAD imm8
-        case 0xD7: return L;                          // XLAT
-        case 0xD6: return L;                          // SALC (286)
-        default: return -1;                           // 未知：跳过比对
-    }
-}
-
-// 最近 itrace 环形缓冲里 PC（实模式线性 cs*16+ip）的最大-最小跨度；不足 2 条返回 -1。
-int itrace_pc_span(void) {
-    if (itr_count < 2) return -1;
-    uint32_t lo = 0xFFFFFFFFu, hi = 0;
-    for (int k = 0; k < itr_count; k++) {
-        int i = (itr_n + k) % ITRACE_N;
-        uint32_t lin = (uint32_t)itr_cs[i] * 16u + itr_ip[i];
-        if (lin < lo) lo = lin;
-        if (lin > hi) hi = lin;
-    }
-    return (int)(hi - lo);
-}
-
 void cpu_execute_instruction(void) {
     uint32_t addr = cpu_seg_base(cpu.cs) + cpu.ip;
     uint8_t opcode = cpu_mem_read(addr);
-    itr_slot_cur = itrace_push(cpu.cs, cpu.ip, opcode, cpu_mem_read(addr + 1));
 
-    // ★ 诊断：实模式下执行到 IVT 区域（线性 < 0x400）几乎必然是被当代码跑的数据
-    //   （本例里 0016:0070 = 线性 0x1D0 = INT 74h 鼠标向量槽）。首次命中即 dump 现场并停机，
-    //   回放里能看到"是从哪一步（哪条远跳转/IRET）进入 IVT 的"。
+    // ★ 诊断：实模式下执行到 IVT 区域（线性 < 0x400）几乎必然是被当代码跑的数据。
     if (!protect.pe) {
         uint32_t _lin = (uint32_t)(cpu.cs << 4) + cpu.ip;
         if (_lin < 0x400) {
             fprintf(stderr, "[IVT-EXEC] entering IVT as code: CS:IP=%04X:%04X lin=%05X op=%02X\n",
                     cpu.cs, cpu.ip, _lin, opcode);
-            itrace_dump();
+            cpu_fault_dump("exec into IVT as code", 13, "ran off into the interrupt vector table");
             fflush(stderr);
             cpu_running = false;
             return;
@@ -3043,17 +2848,6 @@ case 0xC6: {
     cpu.prefix_66 = false;
     cpu.prefix_67 = false;
 
-    // ★ 诊断：记录本条指令"真实推进的 IP 长度"。必须在下面异常把 cpu.ip 改回处理
-    //   程序入口之前取值，否则记到的是入口地址而非指令长度。崩溃回放时用不变量
-    //   "下一条 IP == 本条 IP + 本条长度" 抓 IP 漂移（不读内存，抗重定位）。
-    if (itr_slot_cur >= 0) {
-        int slot = itr_slot_cur;
-        // 控制流指令的 IP 会跳走，cpu.ip - itr_ip 不是长度而是垃圾值，记 0 表示"不适用"
-        itr_len[slot] = itr_is_cflow(itr_op[slot], itr_op2[slot])
-                        ? 0 : (uint8_t)(cpu.ip - itr_ip[slot]);
-        itr_slot_cur = -1;
-    }
-
     // 数据访问越限/越权已投递 #GP(13)：译码随后推进的 cpu.ip 会覆盖处理程序入口，
     // 这里恢复成异常处理程序的 CS:IP（见 seg_access_check 的说明）。
     bool faulted = seg_fault_abort;
@@ -3109,17 +2903,22 @@ void cpu_fault_dump(const char* kind, uint8_t vector, const char* why) {
 	fprintf(stderr, "[FAULT] PE=%d A20=%d CS_base=%08X CS_limit=%08X MSW=%04X\n",
 	        protect.pe ? 1 : 0, cpu_a20_enabled ? 1 : 0,
 	        cpu.seg_base[SEG_CS], cpu.seg_limit[SEG_CS], protect.msw);
-	// 出错指令附近字节（F6/F7 等已把 IP 推进到下一条，故从 IP-6 起打 8 字节，
-	// IP 所指字节用方括号标出）
+	// 出错指令附近代码：从 IP-128 起dump一段（16 字节/行），IP 所指字节用方括号标出
 	{
-		uint16_t start = (uint16_t)(cpu.ip - 6);
-		fprintf(stderr, "[FAULT] code @%04X:%04X:", cpu.cs, start);
-		for (int i = 0; i < 8; i++) {
-			uint8_t b = cpu_mem_read(cpu_seg_base(cpu.cs) + (uint16_t)(start + i));
-			if (i == 6) fprintf(stderr, " [%02X]", b);
-			else        fprintf(stderr, " %02X", b);
+		uint16_t start = (uint16_t)(cpu.ip - 128);
+		uint32_t base = cpu_seg_base(cpu.cs);
+		fprintf(stderr, "[FAULT] code @%04X:%04X (IP-128)，[xx]=当前IP字节:\n", cpu.cs, start);
+		for (int line = 0; line < 12; line++) {
+			uint16_t rowbase = (uint16_t)(start + line * 16);
+			fprintf(stderr, "[FAULT]   %04X:", rowbase);
+			for (int i = 0; i < 16; i++) {
+				uint16_t a = (uint16_t)(rowbase + i);
+				uint8_t b = cpu_mem_read(base + a);
+				if (a == cpu.ip) fprintf(stderr, " [%02X]", b);
+				else             fprintf(stderr, " %02X", b);
+			}
+			fprintf(stderr, "\n");
 		}
-		fprintf(stderr, "\n");
 	}
 	// 栈顶 8 个字
 	fprintf(stderr, "[FAULT] stack @%04X:%04X:", cpu.ss, cpu.sp);
@@ -3154,7 +2953,8 @@ void cpu_exception(uint8_t vector, const char* why) {
 		return;
 	}
 
-	if (debug_mode) cpu_fault_dump("CPU exception", vector, why);
+	// 任何异常都输出完整寄存器 dump（不再依赖 debug_mode）
+	cpu_fault_dump("CPU exception", vector, why);
 
 	uint32_t va = (uint32_t)vector * 4;
 	uint16_t o = read_word(0, va), s = read_word(0, va + 2);
@@ -3184,7 +2984,6 @@ void cpu_invalid_opcode(uint8_t op) {
 	char why[48];
 	snprintf(why, sizeof(why), "opcode %02Xh", op);
 	cpu_fault_dump("invalid opcode", 6, why);
-	itrace_dump();   // ★ 临时诊断：回溯最近执行过的指令
 	fprintf(stderr, "[FAULT] invalid instruction cannot continue -> halt\n");
 	fflush(stderr);
 	in_fault = 0;
