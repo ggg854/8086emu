@@ -33,6 +33,10 @@ uint32_t cpu_last_cycles = 0;
 // 是否正在投递异常处理程序（用于双重/三重故障判定）；IRET 时清零
 static int in_fault = 0;
 
+// 上一条已执行指令的入口 CS:IP。仅 2 个变量（非 itrace 环形缓冲），
+// 用于故障/跑飞时定位"是从哪一条指令跳过来的"。
+static uint16_t dbg_prev_cs = 0, dbg_prev_ip = 0;
+
 // BIOS ROM 写保护：0xF0000~0xFFFFF 的写入被忽略（与真实硬件一致）。
 //   注意地址必须先过 A20 门再看范围，且 1MB 以上（HMA）不是 ROM。
 bool cpu_rom_write_protect = false;
@@ -989,14 +993,15 @@ void cpu_execute_instruction(void) {
     if (!protect.pe) {
         uint32_t _lin = (uint32_t)(cpu.cs << 4) + cpu.ip;
         if (_lin < 0x400) {
-            fprintf(stderr, "[IVT-EXEC] entering IVT as code: CS:IP=%04X:%04X lin=%05X op=%02X\n",
-                    cpu.cs, cpu.ip, _lin, opcode);
+            fprintf(stderr, "[IVT-EXEC] entering IVT as code: CS:IP=%04X:%04X lin=%05X op=%02X  <- prev=%04X:%04X\n",
+                    cpu.cs, cpu.ip, _lin, opcode, dbg_prev_cs, dbg_prev_ip);
             cpu_fault_dump("exec into IVT as code", 13, "ran off into the interrupt vector table");
             fflush(stderr);
             cpu_running = false;
             return;
         }
     }
+    dbg_prev_cs = cpu.cs; dbg_prev_ip = cpu.ip;   // 记录本条入口，供下一条/故障定位来源
 
     at_post_restart_hook(addr);   // ★ POST 软重启入口：把 A20 复位成上电默认值
 
