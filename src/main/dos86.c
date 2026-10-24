@@ -11,6 +11,9 @@
 #include <string.h>
 #include <signal.h>
 #include <stdarg.h>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 #include <gtk/gtk.h>
 #include "config.h"
 #include "protect.h"
@@ -421,6 +424,19 @@ static void con_render(void) {
     fflush(stdout);
 }
 
+// GUI 渲染节流：全幅重绘 + surface 上传很贵，而 g_idle_add 空闲循环会每秒跑几千帧，
+// 屏幕高频变化时（如 SETUP 进度条）把 CPU 吃满、把整台机器拖慢。限到 ~60fps；
+// CPU 推进走 tick() 的周期预算，不受限。-console 模式不走这里（由 con_render 负责）。
+static void gui_render_throttled(void) {
+    if (console_mode) return;
+    static gint64 last = 0;
+    gint64 now = g_get_monotonic_time();
+    if (now - last < 16000) return;          // 约 60fps
+    last = now;
+    bool r = vga_render();
+    if (r || vga_led_dirty()) gtk_widget_queue_draw(vga.drawing_area);
+}
+
 // tick() 的节流锚点。原来放在 tick 内部当 static，换机器重新启动时不会清零，
 // 会拿上一台机器的时间基准"补账"，故提到文件作用域，由 do_launch 复位。
 static uint64_t tick_anchor_us = 0, tick_anchor_cyc = 0;
@@ -447,9 +463,7 @@ static gboolean tick(gpointer data) {
 
     // ★ CPU 停了：继续渲染，不退出
     if (!cpu_running) {
-        bool r = vga_render();
-        if (!console_mode && (r || vga_led_dirty()))
-            gtk_widget_queue_draw(vga.drawing_area);
+        gui_render_throttled();
         return TRUE;
     }
 
@@ -635,14 +649,29 @@ static gboolean tick(gpointer data) {
         // 等到才认为定时器正常（否则报 101 停机）。
         io_pit_step(cpu_last_cycles);
         cyc_this_frame += cpu_last_cycles;
-        // ★ 心跳：定位 POST 死循环（回跳类循环），HEARTBEAT=1 时每 2M 条指令打印 CS:IP
+        // ★ 心跳：定位死循环，HEARTBEAT=1 时每 2M 条指令打印 CS:IP。
+        //   若最近 2048 步都困在 <4KB 的小循环里、且连续两次心跳都如此（客机真卡死，
+        //   而非 BIOS 自检那种跨很大地址范围的快速推进），自动 dump 最近指令并停机。
+        //   非侵入：只在 opt-in 且确实卡住时才触发。
         {
             static int hb_on = -1;
             static uint64_t hb_cnt = 0;
+            static int hb_last_span = -1;
+            static bool hb_have = false;
             if (hb_on < 0) hb_on = getenv("HEARTBEAT") ? 1 : 0;
-            if (hb_on && ((hb_cnt++ & 0x1FFFFF) == 0))
-                fprintf(stderr, "[HB] CS=%04X IP=%04X AX=%04X CX=%04X DX=%04X\n",
-                        cpu.cs, cpu.ip, cpu.ax, cpu.cx, cpu.dx);
+            if (hb_on && ((hb_cnt++ & 0x1FFFFF) == 0)) {
+                int span = itrace_pc_span();
+                fprintf(stderr, "[HB] CS=%04X IP=%04X AX=%04X CX=%04X DX=%04X span=%d\n",
+                        cpu.cs, cpu.ip, cpu.ax, cpu.cx, cpu.dx, span);
+                if (hb_have && span >= 0 && span < 4096 && hb_last_span >= 0 && hb_last_span < 4096) {
+                    fprintf(stderr, "[HB-STUCK] PC stuck in <4KB loop across 2M instructions: CS:IP=%04X:%04X span=%d\n",
+                            cpu.cs, cpu.ip, span);
+                    itrace_dump();
+                    fflush(stderr);
+                    cpu_running = false;
+                }
+                hb_last_span = span; hb_have = true;
+            }
         }
         if (!cpu_prefix_step) io_timer_poll();
 
@@ -668,11 +697,8 @@ static gboolean tick(gpointer data) {
         insn_count++;
     }
 
-    // ★ 每帧都渲染 + 触发 GTK 重绘
-    if (!console_mode) {
-        bool r = vga_render();
-        if (r || vga_led_dirty()) gtk_widget_queue_draw(vga.drawing_area);
-    }
+    // ★ 渲染（限帧，避免空闲循环全速重绘吃满 CPU）
+    gui_render_throttled();
 
     // 标题：每秒更新一次。主频直接由"这一步走掉多少 CPU 周期"统计，
     // 目标 20MHz 时这里应稳定显示 19.x/20.0 MHz（旧版按指令数估算，无法反映周期级时序）。
@@ -1032,17 +1058,19 @@ static void do_launch(const char* name) {
     gtk_widget_hide(g_manager);
     init_emulator(&cfg);
 
+    if (getenv("VGA_SELFTEST")) { vga_self_test(); printf("[VGA] self-test done\n"); return; }
+
     if (console_mode) {
         g_emu_active = true;
         printf("[CONSOLE] terminal mode, Ctrl+C to quit\n");
         fputs("\x1b[2J\x1b[H", stdout);
         memset(con_shadow, 0, sizeof(con_shadow));
-        g_thread_new("con-in", con_reader, NULL);
+        CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)con_reader, NULL, 0, NULL);
         while (emu_running && g_emu_active) {
             tick(NULL);
             con_poll_input();
             con_render();
-            g_usleep(1000);
+            Sleep(1);
         }
         emu_shutdown(false);
     } else {
@@ -1159,8 +1187,15 @@ static void open_manager(void) {
     gtk_widget_show_all(g_manager);
 }
 
+static void btrace(const char* s) {
+    FILE* f = fopen("boot_trace.log", "a");
+    if (f) { fprintf(f, "%s\n", s); fflush(f); fclose(f); }
+}
+
 int main(int argc, char* argv[]) {
     setbuf(stdout, NULL);
+    { FILE* bf = fopen("boot_trace.log", "w"); if (bf) fclose(bf); }
+    btrace("MAIN START");
 
     // -help
     for (int i = 1; i < argc; i++) {
@@ -1202,11 +1237,18 @@ int main(int argc, char* argv[]) {
     memset(&cfg, 0, sizeof(cfg));
 
     // 先 gtk_init（配置窗口需要）
-    gtk_init(&argc, &argv);
+    // -console 是无窗口模式，不需要 GTK；无显示环境下 gtk_init 会失败/卡住，
+    // 因此 headless 时跳过它，并把 stdout 设为无缓冲，便于脚本捕获输出。
+    if (!cli_console) {
+        gtk_init(&argc, &argv);
+    } else {
+        setvbuf(stdout, NULL, _IONBF, 0);
+    }
 
     // 尝试加载配置
     bool loaded = config_load(config_path, &cfg);
     (void)loaded;
+    btrace("CONFIG LOADED");
 
     // 命令行覆盖配置
     if (cli_bios) { strncpy(cfg.bios, cli_bios, sizeof(cfg.bios) - 1); cfg.bios[sizeof(cfg.bios) - 1] = 0; }
@@ -1235,18 +1277,29 @@ int main(int argc, char* argv[]) {
 
         if (cfg.console) console_mode = true;
         debug_mode = cfg.debug;
+        btrace("BEFORE INIT");
         init_emulator(&cfg);
+        btrace("AFTER INIT");
+
+        if (getenv("VGA_SELFTEST")) { vga_self_test(); printf("[VGA] self-test done\n"); return 0; }
 
         if (console_mode) {
+#ifdef _WIN32
+            /* 给进程一个真实控制台（让 GLib 的 stdin 校验通过）；
+               但不要把 stdout/stderr 重定向到新控制台，否则在无头环境里丢失输出。*/
+            if (!GetConsoleWindow()) AllocConsole();
+#endif
+            btrace("CONSOLE MODE");
             printf("[CONSOLE] terminal mode, Ctrl+C to quit\n");
             fputs("\x1b[2J\x1b[H", stdout);
             memset(con_shadow, 0, sizeof(con_shadow));
-            g_thread_new("con-in", con_reader, NULL);
+            CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)con_reader, NULL, 0, NULL);
+            btrace("ENTER LOOP");
             while (emu_running) {
                 tick(NULL);
                 con_poll_input();
                 con_render();
-                g_usleep(1000);
+                Sleep(1);
             }
             printf("\nEmulator stopped.\n");
             ide_cleanup();

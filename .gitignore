@@ -1,23 +1,16 @@
-# 编译产物
+# 构建产物
+build/
 *.o
 *.exe
-build/
+*.log
 
-# 便携打包产物（exe + 依赖 DLL + data 副本，体积大，不入库）
-dist/
+# 运行期临时/调试文件
+con_out.txt
+iotrace.log
+iotrace_port.log
+boot_trace.log
+vga_*.log
+run_*.ps1
 
-# 磁盘镜像与运行时状态（不入库）
-*.img
-*.ima
-*.IMA
-dos.img
-cmos.rom
-
-# BIOS ROM：第三方固件，需自备（见 README 的 Build 一节）
-*.BIN
-*.bin
-*.ROM
-*.rom
-
-# 用户创建的机器配置（含本机绝对路径，不入库）
-machines/
+# 大磁盘镜像（用户数据，不入仓；本地保留即可）
+data/dos.img

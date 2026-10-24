@@ -1,0 +1,11 @@
+{
+  "bios":"D:\\downl\\xt-bios.bin",
+  "disk":"",
+  "floppy_a":"C:\\Users\\ASUS\\Desktop\\DISK01.IMG",
+  "floppy_b":null,
+  "cpu_mhz":4,
+  "ram_mb":1,
+  "composite":false,
+  "console":false,
+  "debug":false
+}

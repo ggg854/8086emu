@@ -1,0 +1,11 @@
+{
+  "bios":"D:\\dos86\\data\\IBMATBIOS.BIN",
+  "disk":"",
+  "floppy_a":"D:\\downl\\atp.img",
+  "floppy_b":null,
+  "cpu_mhz":20,
+  "ram_mb":5,
+  "composite":false,
+  "console":false,
+  "debug":false
+}

@@ -823,6 +823,22 @@ static void int13_fail(uint8_t err) {
     cpu.ax = (uint16_t)((cpu.ax & 0x00FF) | ((uint16_t)err << 8));
 }
 
+// ★ 诊断：把每次 INT 13h 读/写（AH/CHS/AL→LBA、结果、首字节）记到 int13.log，
+//   用来定位 SETUP「Error writing --> help.hlp」这类写盘失败。每行刷盘，强杀不丢。
+//   上限 25 万行防止刷爆。事后删掉。
+static void int13_trace(const char* tag, uint8_t ah, uint8_t al,
+                        uint8_t ch, uint8_t cl, uint8_t dh,
+                        uint32_t lba, const char* res, int d0) {
+    static FILE* f = NULL;
+    static long n = 0;
+    if (!f) f = fopen("int13.log", "w");
+    if (!f || n > 250000) return;
+    n++;
+    fprintf(f, "%-7s AH=%02X AL=%-3u CH=%02X CL=%02X DH=%02X LBA=%-7u d0=%02X %s\n",
+            tag, ah, al, ch, cl, dh, lba, (unsigned)(d0 & 0xFF), res ? res : "");
+    fflush(f);
+}
+
 // INT 0F1h：硬盘 INT 13h 服务（DL >= 80h）
 void ide_int13_handle(void) {
     uint8_t ah = (uint8_t)(cpu.ax >> 8);
@@ -868,6 +884,7 @@ void ide_int13_handle(void) {
         case 0x04: {                     // 校验扇区
             uint32_t lba = int13_chs_to_lba(ch, cl, dh);
             if (al == 0 || lba == 0xFFFFFFFF || lba + al > IDE_SECTORS) {
+                int13_trace("RD-ERR", ah, al, ch, cl, dh, lba, "REJECT", 0);
                 int13_fail(0x04);        // 找不到扇区
                 return;
             }
@@ -877,13 +894,6 @@ void ide_int13_handle(void) {
                                   ide_disk.data + (size_t)(lba + i) * IDE_SECTOR_SIZE,
                                   IDE_SECTOR_SIZE);
             }
-            if (debug_mode)
-                printf("[IDE] INT13 read LBA=%u -> %04X:%04X first 4 bytes=%02X %02X %02X %02X\n",
-                       lba, cpu.es, cpu.bx,
-                       ide_disk.data[(size_t)lba * IDE_SECTOR_SIZE + 0],
-                       ide_disk.data[(size_t)lba * IDE_SECTOR_SIZE + 1],
-                       ide_disk.data[(size_t)lba * IDE_SECTOR_SIZE + 2],
-                       ide_disk.data[(size_t)lba * IDE_SECTOR_SIZE + 3]);
             vga_led_activity(0);
             cpu.ax = (uint16_t)((cpu.ax & 0x00FF) | (0x00 << 8));
             break;
@@ -892,6 +902,7 @@ void ide_int13_handle(void) {
         case 0x03: {                     // 写扇区（CHS）
             uint32_t lba = int13_chs_to_lba(ch, cl, dh);
             if (al == 0 || lba == 0xFFFFFFFF || lba + al > IDE_SECTORS) {
+                int13_trace("WR-ERR", ah, al, ch, cl, dh, lba, "REJECT", 0);
                 int13_fail(0x04);
                 return;
             }
@@ -900,6 +911,8 @@ void ide_int13_handle(void) {
                              ide_disk.data + (size_t)(lba + i) * IDE_SECTOR_SIZE,
                              IDE_SECTOR_SIZE);
             ide_dirty = true;
+            int13_trace("WR", ah, al, ch, cl, dh, lba, "OK",
+                        memory[((uint32_t)cpu.es << 4) + cpu.bx]);
             vga_led_activity(0);
             cpu.ax = (uint16_t)((cpu.ax & 0x00FF) | (0x00 << 8));
             break;
@@ -923,6 +936,8 @@ void ide_int13_handle(void) {
             // 不进自己的缓冲，报「All 4 fixed disk partitions are allocated」。
             // DOS 自身用 INT 41h 找 DPT，不依赖这个返回值，所以不返回是安全的。
             cpu.ax = 0x0000;
+            { char b[32]; snprintf(b, sizeof b, "CX=%04X DX=%04X", cpu.cx, cpu.dx);
+              int13_trace("PARM", ah, al, ch, cl, dh, 0xFFFFFFFFu, b, 0); }
             if (debug_mode)
                 printf("[IDE] INT13 AH=08 return CX=%04X DX=%04X\n", cpu.cx, cpu.dx);
             break;
@@ -932,9 +947,12 @@ void ide_int13_handle(void) {
             cpu.ax = (uint16_t)((cpu.ax & 0x00FF) | (0x03 << 8));        // AH=3：硬盘
             cpu.cx = (uint16_t)(IDE_SECTORS >> 16);                       // CX:DX = 扇区总数（CX 高位）
             cpu.dx = (uint16_t)(IDE_SECTORS & 0xFFFF);
+            int13_trace("TYPE", ah, al, ch, cl, dh, 0xFFFFFFFFu, "HD", 0);
             break;
 
         default:                         // 含 0x41/0x48 扩展功能：本模拟器不支持
+            { char b[16]; snprintf(b, sizeof b, "fail%02X", 0x01);
+              int13_trace("UNSUP", ah, al, ch, cl, dh, 0xFFFFFFFFu, b, 0); }
             int13_fail(0x01);
             break;
     }

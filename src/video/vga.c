@@ -12,6 +12,19 @@ VGA vga;
 // VGA 位平面显存
 uint8_t vga_planes[4][VGA_PLANE_SIZE] = {0};
 
+// 0xA0000-0xAFFFF 显存窗口是否由上面的位平面模型接管（cpu.h 的内存读写热路径据此分流，
+// 见 cpu_mem_read / cpu_mem_write）。
+//   只有真正的"位平面图形模式"才置 1：此时一屏像素分散在 4 个平面里，扁平 memory[]
+//   根本放不下 Plane 1-3，客机的写必须过 Map Mask / 写模式 / 位掩码，读要按
+//   Read Map Select 返回。
+//   而 chain4 的 13h（256 色）在显存里是 4 个平面按字节交错（第 n 字节属于第 n%4 平面），
+//   与"同一地址四个平面"的模型布局不同，仍走扁平 memory[]（渲染路径也已如此）。
+bool vga_mem_window_active = false;
+
+// 位平面显存的行跨距（字节）：由 CRTC Offset 寄存器(0x13)推导，见 vga_update_mode。
+//   正常模式它就是"显示宽度/8"；驱动做虚拟桌面时会被设得更大，必须按它走。
+static int vga_plane_stride = 80;
+
 // VGA 端口寄存器
 uint8_t vga_seq_regs[8] = {0};
 uint8_t vga_gc_regs[16] = {0};
@@ -87,6 +100,14 @@ uint8_t vga_dac_write_index = 0;
 static uint8_t cga_mode_reg  = 0x29;   // 默认：80x25 文本、彩色、视频开
 static uint8_t cga_color_reg = 0x30;
 static bool    cga_bw = false;         // 0x3D8 bit2：黑白模式
+// 当前 CGA 图形模式是"由 0x3D8 设定"(true) 还是"由 VGA 寄存器识别"(false)。
+//   CGA 端口设定的模式以端口为准，别被 VGA 寄存器默认值切走；
+//   由寄存器识别出的 CGA 模式则允许后续寄存器写继续重算（能正确切回文本/平面）。
+static bool    cga_from_port = false;
+// CGA 图形帧缓冲的真实物理基址：由 VGA 寄存器识别出的 CGA 模式可能落在 0xA0000
+// （mm=0x01，多数 VGA BIOS 的兼容模式 6），也可能落在 0xB8000（mm=0x03，真 CGA）。
+// 渲染按此基址读交错显存，而不是写死的 CGA_TEXT_ADDR。
+static uint32_t cga_fb_addr = CGA_TEXT_ADDR;
 
 uint8_t vga_read_cga_mode(void)  { return cga_mode_reg; }
 uint8_t vga_read_cga_color(void) { return cga_color_reg; }
@@ -307,8 +328,19 @@ void vga_init(int argc, char** argv) {
     vga.cursor_x = 0;
     vga.cursor_y = 0;
     vga.cursor_visible = true;
+    // 诊断用：headless 也分配帧缓冲（纯内存 + cairo image surface，不建任何 GTK 对象），
+    // 这样 vga_render()/vga_debug_dump() 在无窗口模式下也能跑，便于对比渲染结果。
+    vga.pixels = malloc(vga.width * vga.height * sizeof(uint32_t));
+    memset(vga.pixels, 0, vga.width * vga.height * sizeof(uint32_t));
+    vga.surface = cairo_image_surface_create_for_data(
+        (unsigned char*)vga.pixels, CAIRO_FORMAT_RGB24,
+        vga.width, vga.height, vga.width * sizeof(uint32_t));
     init_font();
     vga_set_default_palette();
+    memset(vga_seq_regs, 0, sizeof(vga_seq_regs));
+    memset(vga_gc_regs, 0, sizeof(vga_gc_regs));
+    vga_seq_regs[2] = 0x0F;   // Map Mask 默认写全部平面
+    vga_gc_regs[8]  = 0xFF;   // Bit Mask 默认全部位可改
     printf("[VGA] headless（-console）\n");
     return;
   }
@@ -396,6 +428,10 @@ void vga_init(int argc, char** argv) {
 
   init_font();
   vga_set_default_palette();
+  memset(vga_seq_regs, 0, sizeof(vga_seq_regs));
+  memset(vga_gc_regs, 0, sizeof(vga_gc_regs));
+  vga_seq_regs[2] = 0x0F;   // Map Mask 默认写全部平面
+  vga_gc_regs[8]  = 0xFF;   // Bit Mask 默认全部位可改
 
   gtk_widget_show_all(vga.window);
   gtk_widget_grab_focus(vga.drawing_area);
@@ -457,6 +493,10 @@ static void vga_ensure_canvas(int nw, int nh) {
 void vga_set_mode(VideoMode mode) {
   vga.mode = mode;
 
+  // 只有位平面模式（EGA/VGA 16 色：0Dh/0Fh/10h/12h）才把 A0000 窗口交给 vga_planes；
+  //   文本、CGA、chain4 的 13h 都保持扁平显存，渲染路径不受影响。
+  vga_mem_window_active = (mode == MODE_GFX_640x480);
+
   int nw = vga.width, nh = vga.height;
   switch (mode) {
     case MODE_TEXT_80x25: nw = 640; nh = 400; break;
@@ -505,6 +545,8 @@ void vga_write_cga_mode(uint8_t val) {
   else
     want = (val & 0x01) ? MODE_TEXT_80x25 : MODE_TEXT_40x25;
 
+  cga_from_port = (want == MODE_CGA_320x200 || want == MODE_CGA_640x200);
+  if (cga_from_port) cga_fb_addr = CGA_TEXT_ADDR;   // 0x3D8 设定的真 CGA 帧缓冲恒在 B8000
   if (want != vga.mode) vga_set_mode(want);
 }
 
@@ -522,15 +564,52 @@ void vga_write_cga_color(uint8_t val) {
 //   程序一进图形模式就被渲染成文本（"退回文本模式"）。这里每次写 VGA 寄存器后重算模式。
 // ============================================================
 void vga_update_mode(void) {
-    // CGA 模式由 0x3D8 单独管理，CGA 上没有 GC；别被 GC[6] 误判成文本/图形
-    if (vga.mode == MODE_CGA_320x200 || vga.mode == MODE_CGA_640x200)
+    // ★ 临时诊断：把模式判定所用的寄存器变化写入文件（静默，不刷终端；定位后删除）
+    {
+        static uint8_t pg=0xFF, ps=0xFF, pc12=0xFF, pc01=0xFF, pc13=0xFF, pc07=0xFF, pmm=0xFF, pm=0xFF;
+        static FILE* df = NULL;
+        if (!df) df = fopen("d:/dos86/vga_diag.log", "w");
+        uint8_t ng = vga_gc_regs[6], ns = vga_seq_regs[4];
+        uint8_t nc12 = vga_crtc_regs[0x12], nc01 = vga_crtc_regs[0x01];
+        uint8_t nc13 = vga_crtc_regs[0x13], nc07 = vga_crtc_regs[0x07];
+        uint8_t nmm = (ng >> 2) & 0x03, nm = (uint8_t)vga.mode;  // mm 是 GC[6] 的 bit3-2
+        if (ng!=pg||ns!=ps||nc12!=pc12||nc01!=pc01||nc13!=pc13||nc07!=pc07||nmm!=pmm||nm!=pm) {
+            pg=ng; ps=ns; pc12=nc12; pc01=nc01; pc13=nc13; pc07=nc07; nmm=nmm; pm=nm;
+            if (df) { fprintf(df, "[DBG] gc6=%02X seq4=%02X c12=%02X c01=%02X c13=%02X c07=%02X mm=%d -> mode=%d addr=%X win=%d fp=%d\n",
+                    ng, ns, nc12, nc01, nc13, nc07, nmm, vga.mode, cga_fb_addr, vga_mem_window_active, cga_from_port);
+                    fflush(df); }
+        }
+    }
+    // CGA 模式若由 0x3D8 端口设定，则以端口为准（CGA 上没有 GC，VGA 寄存器可能是
+    //   默认值，别被 GC[6] 误判切走）；由 VGA 寄存器识别出的 CGA 模式则允许后续重算。
+    if ((vga.mode == MODE_CGA_320x200 || vga.mode == MODE_CGA_640x200) && cga_from_port)
         return;
 
-    uint8_t gc  = vga_gc_regs[6];        // GC Misc：bit0-1 = 内存映射选择
-    uint8_t seq = vga_seq_regs[4];       // Sequencer Memory Mode：bit0=chain4（256 色）
-    uint8_t mm  = gc & 0x03;             // 00/01=A0000(图形) 10=B0000(单色文本) 11=B8000(彩色文本)
+    uint8_t gc  = vga_gc_regs[6];        // GC Misc 寄存器
+    uint8_t seq = vga_seq_regs[4];       // Sequencer Memory Mode：bit3=chain4（256 色）
+    // ★ GC Misc 的显存映射选择是 bit3-2（不是 bit0-1）：
+    //   00/01=A0000(图形) 10=B0000(单色文本) 11=B8000(彩色文本)。
+    //   原代码误取 bit0-1，会把 gc6=0x0D(真实 B8000 图形)错判成 A0000。
+    uint8_t mm  = (gc >> 2) & 0x03;
 
-    if (mm >= 0x02) {                    // 文本模式（B0000 单色 / B8000 彩色）
+    if (mm >= 0x02) {                    // B0000 单色文本 / B8000 彩色文本或 CGA 图形
+        // ★ B8000 上"彩色文本"与"CGA 图形模式(04/05/06h)"同址：VGA BIOS 设这些图形
+        //   模式时只写 VGA 寄存器、不写 0x3D8，且 GC[6] 内存映射与彩色文本同为 B8000。
+        //   只按内存映射判会把 CGA 图形当文本，把图形位图当字符码画成满屏乱字符。
+        //   用 Sequencer 时钟模式(Seq[1] bit0)区分：0=9 点字符时钟(文本)，1=8 点像素
+        //   时钟(图形)；再加"垂直显示 <=300 行"约束，避免误伤 80x50 等 8 点时钟文本。
+        int vde200 = vga_crtc_regs[0x12]
+                   | ((vga_crtc_regs[0x07] & 0x02) << 7)
+                   | ((vga_crtc_regs[0x07] & 0x40) << 3);
+        // 加 GC[6] bit0（图形位）鉴别：避免把 80x50 等 8 点时钟文本模式误判成 CGA 图形。
+        if (mm == 0x03 && (gc & 0x01) && (vga_seq_regs[1] & 0x01) && (vde200 + 1) <= 300) {
+            uint8_t hd = vga_crtc_regs[0x01];
+            VideoMode w2 = (hd >= 60) ? MODE_CGA_640x200 : MODE_CGA_320x200;
+            cga_from_port = false;
+            cga_fb_addr = CGA_TEXT_ADDR;
+            if (vga.mode != w2) vga_set_mode(w2);
+            return;
+        }
         // 列数以 CRTC 的 Horizontal Displayed（index 01）为准。VGA 上"每行字符数"
         // 的权威来源是它，而不是 CGA 兼容口 0x3D8 的快照。
         //   原先这里只判断"当前是否已是文本模式"，而把被误切成 40 列的
@@ -547,12 +626,37 @@ void vga_update_mode(void) {
         }
         return;
     }
-    if (seq & 0x01) {                    // chain4 → 320x200x256
+    // ★ chain4 是 Sequencer reg4 的 bit3（0x08），不是 bit0。
+    //   VGA BIOS 的模式表里 13h 写的是 reg4=0x0E（bit1|bit2|bit3），
+    //   16 色平面模式（0Dh/10h/12h）写的是 0x06（bit1|bit2，odd/even 关闭=顺序平面）。
+    //   按 bit0 判会把 13h 误当成平面模式：既走了平面渲染（读到空平面→黑屏），
+    //   又抢走了它本该用的扁平显存布局。
+    if (seq & 0x08) {                    // chain4 → 320x200x256
         if (vga.mode != MODE_GFX_320x200) {
             
             vga_set_mode(MODE_GFX_320x200);
         }
         return;
+    }
+    // ★ CGA 兼容图形模式（4/5/6h）常由 VGA BIOS 映射在 0xA0000（mm=0x01/0x00，GC[6]=0x05 一类），
+    //   此时 mm<0x02 不会被上面的 B8000 分支捕获，会掉进下面的位平面渲染 → 整屏乱码。
+    //   识别条件：A0000 上只有图形模式（无文本），且"图形位(GC[6] bit0) +
+    //   垂直显示<=300 行(200 行)"足以判定是 CGA —— 真·位平面 VGA/EGA 至少 350 行，
+    //   不会被误伤；chain4(13h)已在上面单独处理。这里不强制 Seq[1] bit0（个别 BIOS 设
+    //   CGA 兼容模式 6 未必置 8 点时钟位），以免漏判。
+    //   帧缓冲基址按 mm 取：B8000(map=3)或 A0000(map=0/1)。渲染据此读交错显存。
+    if ((mm < 0x02) && (gc & 0x01)) {
+        int vdeCGA = vga_crtc_regs[0x12]
+                   | ((vga_crtc_regs[0x07] & 0x02) << 7)
+                   | ((vga_crtc_regs[0x07] & 0x40) << 3);
+        if ((vdeCGA + 1) <= 300) {
+            uint8_t hd = vga_crtc_regs[0x01];
+            VideoMode w2 = (hd >= 60) ? MODE_CGA_640x200 : MODE_CGA_320x200;
+            cga_from_port = false;
+            cga_fb_addr = (mm == 0x03) ? CGA_TEXT_ADDR : VGA_GFX_ADDR;
+            if (vga.mode != w2) vga_set_mode(w2);
+            return;
+        }
     }
     // 位平面图形（EGA/VGA 16 色：640x480 / 640x350 / 640x400，以及 EGA 320x200）：
     //   宽高一律由 CRTC 推导 —— 每个字符时钟 = 8 像素，故 宽度 = 水平显示字符数 * 8，
@@ -569,10 +673,24 @@ void vga_update_mode(void) {
         vga_set_mode(MODE_GFX_640x480);
     }
 
+    // ★ CRTC 的 Horizontal Displayed(0x01) 同样是"字符数 − 1"，必须 +1 才是 80/40 列。
+    //   原先漏了 +1：mode 12h 写的 0x4F(=79) 被算成 632 宽、行跨距 79 字节，而客机
+    //   是按 80 字节/行铺位平面 → 每行错开 1 字节，整幅画面沿对角撕裂
+    //   （Windows 2.03 的桌面就是这种斜向拖影；实心色条因整体位移看不出、文字最明显）。
     int hdisp = vga_crtc_regs[0x01];
-    int w = (hdisp ? hdisp : 80) * 8;      // 未编程按 80 列（640 宽）兜底
+    int w = (hdisp ? hdisp + 1 : 80) * 8;  // 未编程按 80 列（640 宽）兜底
     if (w < 320) w = 320;
     if (w > 720) w = 720;
+    // 行跨距 = CRTC Offset(0x13) 的字数 × 2；未编程/小于显示宽度时退化为显示宽度/8。
+    int stride = vga_crtc_regs[0x13] * 2;
+    vga_plane_stride = (stride > w / 8) ? stride : w / 8;
+    {
+        static int lw = -1, lh = -1, ls = -1;
+        if (w != lw || h != lh || vga_plane_stride != ls) {
+            lw = w; lh = h; ls = vga_plane_stride;
+            fprintf(stderr, "[VGA] planar %dx%d stride=%d\n", w, h, vga_plane_stride);
+        }
+    }
     vga_ensure_canvas(w, h);
 
    
@@ -683,6 +801,11 @@ static uint32_t comp_px(const uint8_t* idx, int w, int spp, int p) {
 //   依赖这条路径。没有它，写模式 1 根本无法工作。
 static uint8_t vga_latch[4] = {0, 0, 0, 0};
 
+// ★ 临时诊断：写模式 2/3 与带逻辑运算的写（图标 BitBlt 排查用）。
+//   由环境变量 VGA_WM2_TRACE 开启，避免影响正常构建。
+static FILE* g_vga_trace = NULL;
+static long  g_vga_trace_n = 0;
+
 void vga_mem_write(uint32_t off, uint8_t val) {
     if (off >= VGA_PLANE_SIZE) return;
 
@@ -694,18 +817,34 @@ void vga_mem_write(uint32_t off, uint8_t val) {
     uint8_t logic_op   = (vga_gc_regs[3] >> 3) & 0x03;
     uint8_t write_mode = vga_gc_regs[5] & 0x03;   // GC reg5 低 2 位：写模式
 
-    // 如果 plane_mask 是 0（驱动没设），默认写全部 plane
-    if (plane_mask == 0) plane_mask = 0x0F;
-    // 如果 bit_mask 是 0（驱动没设），默认全部位
-    if (bit_mask == 0) bit_mask = 0xFF;
+    // ★ 不做"是否为零就兜底"的改写：0x00 是合法值。
+    //   Map Mask=0 表示不写任何平面（真·空操作）；Bit Mask=0 表示不改任何位。
+    //   Windows 用"写模式 0 + 位掩码=字形字节"画文字，空白扫描行的字形字节正是 0x00，
+    //   若把 0x00 兜底成 0xFF，空白行会被整行涂成前景色 → 文字周围出现实心黑块。
+    //   正确的默认值（Map Mask=0x0F / Bit Mask=0xFF）在 vga_reset() 里设定。
 
     uint8_t data = val;
     if (rotate) data = (uint8_t)((data >> rotate) | (data << (8 - rotate)));
 
+    // ★ 临时诊断：追踪写模式 2/3 与带逻辑运算的写（图标 BitBlt 排查）
+    if (g_vga_trace_n < 50000 && (write_mode == 2 || write_mode == 3 || logic_op != 0)) {
+        if (!g_vga_trace) {
+            const char* p = getenv("VGA_WM2_TRACE");
+            if (p) g_vga_trace = fopen(p, "w");
+        }
+        if (g_vga_trace) {
+            fprintf(g_vga_trace,
+                "WM=%d EN_SR=%02X SR=%02X BM=%02X LOP=%d OFF=%05X DATA=%02X PM=%02X\n",
+                write_mode, en_sr, set_reset, bit_mask, logic_op, off, val, plane_mask);
+            g_vga_trace_n++;
+            fflush(g_vga_trace);
+        }
+    }
+
     for (int p = 0; p < 4; p++) {
         if (!(plane_mask & (1 << p))) continue;
         uint8_t old = vga_planes[p][off];
-        uint8_t newb;
+        uint8_t newb = old;
         switch (write_mode) {
             case 0: {   // 写模式 0：普通写
                 uint8_t src = (en_sr & (1 << p))
@@ -724,11 +863,15 @@ void vga_mem_write(uint32_t off, uint8_t val) {
                 newb = (uint8_t)((old & ~bit_mask) | (vga_latch[p] & bit_mask));
                 break;
             }
-            case 2: {   // 写模式 2：位扩展
-                newb = 0;
-                for (int b = 0; b < 8; b++)
-                    if (data & (1 << b)) newb |= (1 << b);
-                newb = (uint8_t)((old & ~bit_mask) | (newb & bit_mask));
+            case 2: {   // 写模式 2：位扩展（每像素独立取 置位复位 或 CPU 数据对应位）
+                for (int b = 0; b < 8; b++) {
+                    if (!(bit_mask & (1 << b))) continue;   // 位掩码保护其余像素
+                    uint8_t bitval = (en_sr & (1 << p))
+                                     ? (uint8_t)((set_reset & (1 << p)) ? 1 : 0)
+                                     : (uint8_t)((data >> b) & 1);
+                    if (bitval) newb |=  (uint8_t)(1u << b);
+                    else        newb &= (uint8_t)~(1u << b);
+                }
                 break;
             }
             case 3: {   // 写模式 3：置位复位
@@ -772,45 +915,59 @@ uint8_t vga_mem_read(uint32_t off) {
     }
     return res;
 }
-// 在 VGA 屏幕正中心画一行字（黑底 #AAAAAA 前景）
-static void draw_centered_message(const char* msg) {
-    if (!vga.pixels) return;
-    int len = (int)strlen(msg);
-    int text_w = len * 8;
-    int text_h = 16;
-    int start_x = (vga.width  - text_w) / 2;
-    int start_y = (vga.height - text_h) / 2;
-    if (start_x < 0) start_x = 0;
-    if (start_y < 0) start_y = 0;
+// ============================================================
+// 自检：直接验证 16 色位平面图形路径（不依赖任何客机）。
+//   VGA_SELFTEST=1 时由主程序在启动客机前调用，画已知图案并落盘 vga_selftest.ppm。
+//   期望结果：上 4 条 100px 高色带依次为 蓝(plane0)/绿(plane1)/红(plane2)/深灰(plane3)；
+//   中下白色实心方块；最底行蓝色点应落在每个 8 像素组的同一侧（验证像素位序）。
+// ============================================================
+void vga_self_test(void) {
+    // 按 640x480 重新分配帧缓冲（无头初始化默认 640x400，直接改高会越界写）
+    size_t npx = (size_t)640 * 480;
+    vga.pixels = (uint32_t*)realloc(vga.pixels, npx * sizeof(uint32_t));
+    memset(vga.pixels, 0, npx * sizeof(uint32_t));
+    vga.mode = MODE_GFX_640x480;
+    vga_mem_window_active = true;
+    vga.width = 640; vga.height = 480;
+    vga_plane_stride = 80;
+    vga_set_default_palette();
+    static const uint8_t idpal[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+    memcpy(vga_attr_palette, idpal, 16);
 
-    const uint32_t bg = 0x000000;   // 黑底
-    const uint32_t fg = 0xAAAAAA;   // #AAAAAA 前景
+    for (int p = 0; p < 4; p++) memset(vga_planes[p], 0, VGA_PLANE_SIZE);
 
-    // 黑底（含 2 像素边距）
-    for (int y = start_y - 2; y < start_y + text_h + 2; y++) {
-        if (y < 0 || y >= vga.height) continue;
-        for (int x = start_x - 2; x < start_x + text_w + 2; x++) {
-            if (x < 0 || x >= vga.width) continue;
-            vga.pixels[y * vga.width + x] = bg;
-        }
+    vga_seq_regs[2] = 0x0F;            // 写全部平面
+    vga_gc_regs[8]  = 0xFF;            // 位掩码全开
+
+    // (1) 写模式 3（置位复位填充）：4 条水平色带，验证 平面 p → 颜色位 p
+    vga_gc_regs[5] = 3;                // 写模式 3
+    vga_gc_regs[1] = 0x0F;             // 允许置位复位
+    static const uint8_t band[4] = {1, 2, 4, 8};
+    for (int b = 0; b < 4; b++) {
+        vga_gc_regs[0] = band[b];      // 置位复位值 = 颜色
+        for (int y = b*100; y < b*100 + 100; y++)
+            for (int xb = 0; xb < 80; xb++)
+                vga_mem_write((uint32_t)(y*80 + xb), 0x00);
     }
 
-    // 前景字
-    for (int i = 0; i < len; i++) {
-        uint8_t ch = (uint8_t)msg[i];
-        if (ch < 32 || ch > 127) ch = '?';
-        for (int y = 0; y < 16; y++) {
-            uint8_t bits = font8x16[ch][y];
-            for (int x = 0; x < 8; x++) {
-                int px = start_x + i * 8 + x;
-                int py = start_y + y;
-                if (px < 0 || px >= vga.width || py < 0 || py >= vga.height) continue;
-                vga.pixels[py * vga.width + px] =
-                    (bits & (0x80 >> x)) ? fg : bg;
-            }
-        }
-    }
+    // (2) 写模式 2 + 置位复位(白)：实心白方块，验证位展开/置位复位
+    vga_gc_regs[5] = 2;
+    vga_gc_regs[0] = 0x0F;
+    vga_gc_regs[1] = 0x0F;
+    for (int y = 420; y < 460; y++)
+        for (int xb = 200; xb < 240; xb++)
+            vga_mem_write((uint32_t)(y*80 + xb), 0xFF);
+
+    // (3) 写模式 2 无置位复位：每字节只置 bit0，验证像素位序
+    vga_gc_regs[1] = 0x00;
+    for (int y = 470; y < 480; y++)
+        for (int xb = 0; xb < 80; xb++)
+            vga_mem_write((uint32_t)(y*80 + xb), 0x01);
+
+    vga_debug_dump("D:/dos86/data/vga_selftest.ppm");
+    fprintf(stderr, "[VGA] self-test dumped -> D:/dos86/data/vga_selftest.ppm\n");
 }
+
 // ============================================================
 // 完整渲染
 // ============================================================
@@ -819,6 +976,24 @@ bool vga_render(void) {
 
     const uint32_t W = (uint32_t)vga.width;
     uint32_t* __restrict px = vga.pixels;
+
+    // ★ 临时诊断：首次进入 planar 模式时把 4 个平面的字节指纹写入文件（静默；定位后删除）
+    if (vga.mode == MODE_GFX_640x480) {
+        static FILE* rf = NULL;
+        static bool dumped = false;
+        if (!rf) rf = fopen("d:/dos86/vga_planes_raw.log", "w");
+        if (!dumped) {
+            dumped = true;
+            for (int pl = 0; pl < 4; pl++) {
+                const uint8_t* p = &vga_planes[pl][0];
+                fprintf(rf, "PL%d row0 :", pl); for (int i = 0; i < 32; i++) fprintf(rf, " %02X", p[i]);
+                fprintf(rf, "\nPL%d row1(+80):", pl); for (int i = 0; i < 32; i++) fprintf(rf, " %02X", p[80 + i]);
+                fprintf(rf, "\n");
+            }
+            fprintf(rf, "stride=%d width=%d height=%d\n", vga_plane_stride, vga.width, vga.height);
+            fflush(rf);
+        }
+    }
 
     // ------------------------------------------------------------
     // 文本模式 80x25 / 40x25
@@ -925,12 +1100,13 @@ bool vga_render(void) {
         const uint8_t* p2 = vga_planes[2];
         const uint8_t* p3 = vga_planes[3];
 
-        int bytes_per_row = vga.width / 8;   // ★ 随 CRTC 推导出的实际宽度，不再写死 80
+        int bytes_per_row = vga.width / 8;   // ★ 显示宽度（像素/8），随 CRTC 推导
+        int stride = vga_plane_stride;       // ★ 显存行跨距（字节），来自 CRTC Offset
         for (int y = 0; y < vga.height; y++) {
             uint32_t* dst = &px[y * W];
-            uint32_t base = (uint32_t)(y * vga.width) / 8;
+            uint32_t base = (uint32_t)y * (uint32_t)stride;
             for (int xb = 0; xb < bytes_per_row; xb++) {
-                uint32_t off = base + xb;
+                uint32_t off = (base + xb) & 0xFFFF;   // 平面地址 16 位回绕
                 uint8_t b0 = p0[off], b1 = p1[off], b2 = p2[off], b3 = p3[off];
                 for (int bit = 7; bit >= 0; bit--) {
                     uint8_t raw = ((b0 >> bit) & 1) |
@@ -980,8 +1156,10 @@ bool vga_render(void) {
                         pidx[i + 1] = v;
                     }
                 }
-                int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
-                const uint8_t* src = &memory[base];
+                uint32_t cga_off = cga_from_port ? (((y & 1) ? 0x2000u : 0) + ((uint32_t)(y >> 1)) * 80u)
+                                                : ((uint32_t)y * 80u);
+                const uint8_t* src = (cga_fb_addr == VGA_GFX_ADDR && vga_mem_window_active)
+                                      ? &vga_planes[0][cga_off] : &memory[cga_fb_addr + cga_off];
                 for (int x = 0; x < 320; x++) {
                     uint8_t b = src[x >> 2];
                     idx[x] = pidx[(b >> ((3 - (x & 3)) * 2)) & 3];
@@ -999,8 +1177,10 @@ bool vga_render(void) {
             }
         } else {
             for (int y = 0; y < 200; y++) {
-                int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
-                const uint8_t* src = &memory[base];
+                uint32_t cga_off = cga_from_port ? (((y & 1) ? 0x2000u : 0) + ((uint32_t)(y >> 1)) * 80u)
+                                                : ((uint32_t)y * 80u);
+                const uint8_t* src = (cga_fb_addr == VGA_GFX_ADDR && vga_mem_window_active)
+                                      ? &vga_planes[0][cga_off] : &memory[cga_fb_addr + cga_off];
                 int dy = y * 2;
                 uint32_t* d0 = &px[dy * W];
                 uint32_t* d1 = &px[(dy + 1) * W];
@@ -1032,44 +1212,26 @@ bool vga_render(void) {
             for (int y = 0; y < 200; y++) {
                 uint8_t creg = cga_color_reg;
                 uint8_t bg6 = creg & 0x0F;
-                int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
-                const uint8_t* src = &memory[base];
+                uint32_t cga_off = cga_from_port ? (((y & 1) ? 0x2000u : 0) + ((uint32_t)(y >> 1)) * 80u)
+                                                : ((uint32_t)y * 80u);
+                const uint8_t* src = (cga_fb_addr == VGA_GFX_ADDR && vga_mem_window_active)
+                                      ? &vga_planes[0][cga_off] : &memory[cga_fb_addr + cga_off];
                 for (int x = 0; x < 640; x++)
                     idx[x] = (src[x >> 3] & (0x80 >> (x & 7))) ? fg6 : bg6;
                 for (int x = 0; x < 640; x++) line[x] = comp_px(idx, 640, 1, x);
                 int dy = y * 2;
                 memcpy(&px[dy * W], line, 640 * 4);
                 memcpy(&px[(dy + 1) * W], line, 640 * 4);
-            }
-            cairo_surface_mark_dirty(vga.surface);
-            // ★ 临时诊断（640x200 复合分支，定位后删除）——与末尾逻辑一致
-            {
-                static int diag_n6 = 0;
-                if (diag_n6 < 12) {
-                    diag_n6++;
-                    FILE* lf = fopen("vga_comp.log", diag_n6 == 1 ? "w" : "a");
-                    if (lf) {
-                        uint32_t total = W * (uint32_t)vga.height;
-                        long white = 0, color = 0;
-                        for (uint32_t i = 0; i < total; i++) {
-                            uint32_t c = px[i];
-                            int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
-                            if (r > 250 && g > 250 && b > 250) white++;
-                            else if (!(r < 8 && g < 8 && b < 8)) color++;
-                        }
-                        fprintf(lf, "frame6-%2d mode=640 creg=0x%02X bw=%d white=%ld color=%ld total=%u (white%%=%ld color%%=%ld)\n",
-                                diag_n6, cga_color_reg, cga_bw, white, color, total,
-                                total ? white * 100 / total : 0, total ? color * 100 / total : 0);
-                        fclose(lf);
-                    }
                 }
-            }
-            cga_frame_id++;
+                cairo_surface_mark_dirty(vga.surface);
+                cga_frame_id++;
             return true;
         }
         for (int y = 0; y < 200; y++) {
-            int base = CGA_TEXT_ADDR + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
-            const uint8_t* src = &memory[base];
+            uint32_t cga_off = cga_from_port ? (((y & 1) ? 0x2000u : 0) + ((uint32_t)(y >> 1)) * 80u)
+                                            : ((uint32_t)y * 80u);
+            const uint8_t* src = (cga_fb_addr == VGA_GFX_ADDR && vga_mem_window_active)
+                                  ? &vga_planes[0][cga_off] : &memory[cga_fb_addr + cga_off];
             int dy = y * 2;
             uint32_t* d0 = &px[dy * W];
             uint32_t* d1 = &px[(dy + 1) * W];
@@ -1085,41 +1247,7 @@ bool vga_render(void) {
         }
     }
 
-    // VGA 640x480 平面全 0 → 提示
-    if (vga.mode == MODE_GFX_640x480) {
-        bool all_zero = true;
-        for (int p = 0; p < 4 && all_zero; p++) {
-            for (int i = 0; i < 64; i++) {
-                if (vga_planes[p][i] != 0) { all_zero = false; break; }
-            }
-        }
-        if (all_zero) draw_centered_message("Screen not initialized(yet).");
-    }
-
     cairo_surface_mark_dirty(vga.surface);
-
-    // ★ 临时诊断：复合伪色白屏排查（定位后删除）
-    if (cga_composite) {
-        static int diag_n = 0;
-        if (diag_n < 12) {
-            diag_n++;
-            FILE* lf = fopen("vga_comp.log", diag_n == 1 ? "w" : "a");
-            if (lf) {
-                uint32_t total = W * (uint32_t)vga.height;
-                long white = 0, color = 0;
-                for (uint32_t i = 0; i < total; i++) {
-                    uint32_t c = px[i];
-                    int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
-                    if (r > 250 && g > 250 && b > 250) white++;
-                    else if (!(r < 8 && g < 8 && b < 8)) color++;
-                }
-                fprintf(lf, "frame%-2d mode=%d creg=0x%02X bw=%d white=%ld color=%ld total=%u (white%%=%ld color%%=%ld)\n",
-                        diag_n, vga.mode, cga_color_reg, cga_bw, white, color, total,
-                        total ? white * 100 / total : 0, total ? color * 100 / total : 0);
-                fclose(lf);
-            }
-        }
-    }
 
     cga_frame_id++;
     return true;
@@ -1128,6 +1256,23 @@ bool vga_render(void) {
 // ============================================================
 // 辅助
 // ============================================================
+// ★ 临时诊断：把当前帧缓冲写成 PPM（验证图标/黑块用，定位后删除）
+void vga_debug_dump(const char* path) {
+    if (!vga.pixels) return;
+    vga_render();
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", vga.width, vga.height);
+    for (int i = 0; i < vga.width * vga.height; i++) {
+        uint32_t c = vga.pixels[i];
+        unsigned char rgb[3] = { (unsigned char)((c >> 16) & 0xFF),
+                                 (unsigned char)((c >> 8) & 0xFF),
+                                 (unsigned char)(c & 0xFF) };
+        fwrite(rgb, 1, 3, f);
+    }
+    fclose(f);
+}
+
 void vga_clear(uint8_t attr) {
   for (int i = 0; i < 80 * 25; i++) {
     memory[CGA_TEXT_ADDR + i * 2] = ' ';
@@ -1141,6 +1286,12 @@ void vga_clear(uint8_t attr) {
 void vga_reset(void) {
   vga_set_mode(MODE_TEXT_80x25);
   vga_set_default_palette();
+  // VGA 复位后的寄存器默认值（BIOS 随后会按模式重新编程；这里先给规范初值，
+  //   免得客机在编程前写显存时，Map Mask / Bit Mask 为 0 导致写入被吞）。
+  memset(vga_seq_regs, 0, sizeof(vga_seq_regs));
+  memset(vga_gc_regs, 0, sizeof(vga_gc_regs));
+  vga_seq_regs[2] = 0x0F;   // Map Mask：写全部 4 个平面
+  vga_gc_regs[8]  = 0xFF;   // Bit Mask：全部位可改
   vga_clear(0x07);
   vga.cursor_visible = true;
 }

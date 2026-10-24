@@ -45,6 +45,8 @@ void vga_set_headless(bool on);
 void vga_cleanup(void);
 void vga_set_mode(VideoMode mode);
 bool vga_render(void);
+void vga_debug_dump(const char* path);   // TEMP 诊断：帧缓冲写 PPM
+void vga_self_test(void);                 // TEMP 诊断：直接验证 16 色位平面图形路径
 void vga_clear(uint8_t attr);
 // 机器复位（GTK「重启」按钮）：回到 80x25 文本模式并清屏
 void vga_reset(void);
@@ -94,5 +96,9 @@ extern uint8_t vga_crtc_regs[0x20];
 void vga_update_mode(void);
 uint8_t vga_mem_read(uint32_t off);
 void    vga_mem_write(uint32_t off, uint8_t val);
-bool    vga_mem_owns(uint32_t addr);   // 判断该地址是否落在 VGA 窗口
+// 0xA0000-0xAFFFF 显存窗口是否由上面的 vga_planes 位平面模型接管。
+//   cpu.h 的 cpu_mem_read / cpu_mem_write（每条指令都会走的热路径）据此分流：
+//   位平面模式下客机对 A0000 的读写必须过 Map Mask / 写模式 / Read Map Select。
+//   由 vga_set_mode 随模式维护（只有 MODE_GFX_640x480 这一族平面模式置 1）。
+extern bool vga_mem_window_active;
 #endif

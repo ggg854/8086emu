@@ -1,0 +1,11 @@
+{
+  "bios":"D:\\dos86\\data\\PCXTBIOS.BIN",
+  "disk":"D:\\dos86\\data\\dos.img",
+  "floppy_a":"D:\\downl\\Microsoft MS-DOS 6.20 (3.5)\\Disk1.img",
+  "floppy_b":null,
+  "cpu_mhz":20,
+  "ram_mb":2,
+  "composite":false,
+  "console":true,
+  "debug":false
+}

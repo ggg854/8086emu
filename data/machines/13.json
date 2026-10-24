@@ -1,0 +1,11 @@
+{
+  "bios":"..\/data\/PCXTBIOS.BIN",
+  "disk":"",
+  "floppy_a":"C:\\Users\\ASUS\\Desktop\\DISK01.IMG",
+  "floppy_b":null,
+  "cpu_mhz":20,
+  "ram_mb":8,
+  "composite":false,
+  "console":false,
+  "debug":false
+}

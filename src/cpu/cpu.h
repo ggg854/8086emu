@@ -81,6 +81,9 @@ void cpu_reset(void);
 void cpu_execute_instruction(void);
 // 诊断：回放最近执行过的 CS:IP / 长度并做 IP 漂移检测（cpu.c 内实现）
 void itrace_dump(void);
+// 诊断：返回最近 itrace 环形缓冲里 PC（实模式线性 cs*16+ip）的最大-最小跨度；
+//   用于卡死检测——若客机困在 <4KB 的小循环里，跨度很小；不足 2 条返回 -1。
+int itrace_pc_span(void);
 void cpu_interrupt(uint8_t int_num);
 // 异常/故障报告（除零、无效指令、通用保护、双重/三重故障）
 void cpu_fault_dump(const char* kind, uint8_t vector, const char* why);
@@ -117,16 +120,38 @@ void cpu_request_reset(void);
 //   所以 >1MB 必须真的能存能取；若像 XT 那样读回 0xFF，POST 会判定没有扩展内存。
 #define CPU_RAM_INSTALLED  memory_size   // 跟随 memory_size（运行时可改，见 cpu.c）
 extern bool cpu_rom_write_protect;
+void cpu_mem_watch(uint32_t addr, uint8_t val);   // TEMP 写监视
+
+// ---- 显卡显存窗口 0xA0000-0xAFFFF ----
+//   EGA/VGA 的 16 色平面模式（0Dh/0Fh/10h/12h）下，一屏像素分散在 4 个位平面里，
+//   扁平的 memory[] 放不下 Plane 1-3：客机往 A0000 写一个字节，要按 Sequencer
+//   Map Mask、GC 写模式 0-3 / 位掩码 / 旋转 / 逻辑运算、置位复位去改 4 个平面；
+//   读回要按 Read Map Select（或读模式 1 的颜色比较）取，并且刷新锁存器
+//   （写模式 1 的数据来源，图形拷贝/位块传输全靠它）。
+//   这些逻辑在 vga.c 的 vga_mem_write / vga_mem_read 里，窗口是否生效由
+//   vga_mem_window_active 控制（文本、CGA、chain4 的 13h 仍走扁平显存）。
+//   定义在 vga.c；此处只声明，免得 cpu.h 反向依赖带 GTK 的 vga.h。
+#define VGA_WINDOW_BASE 0x0A0000u
+#define VGA_WINDOW_SIZE 0x10000u
+extern bool vga_mem_window_active;
+uint8_t vga_mem_read(uint32_t off);
+void    vga_mem_write(uint32_t off, uint8_t val);
+
 static inline uint8_t cpu_mem_read(uint32_t addr) {
 	addr = cpu_a20_enabled ? (addr & 0xFFFFFF) : (addr & 0xFFFFF);
 	if (addr >= CPU_RAM_INSTALLED || addr >= memory_size) return 0xFF;
+	if (vga_mem_window_active && (addr - VGA_WINDOW_BASE) < VGA_WINDOW_SIZE)
+		return vga_mem_read(addr - VGA_WINDOW_BASE);
 	return memory[addr];
 }
-void cpu_mem_watch(uint32_t addr, uint8_t val);   // TEMP 写监视
 static inline void cpu_mem_write(uint32_t addr, uint8_t val) {
 	addr = cpu_a20_enabled ? (addr & 0xFFFFFF) : (addr & 0xFFFFF);
 	if (addr >= CPU_RAM_INSTALLED || addr >= memory_size) return;
 	if (cpu_rom_write_protect && addr >= 0xF0000 && addr < 0x100000) return;
+	if (vga_mem_window_active && (addr - VGA_WINDOW_BASE) < VGA_WINDOW_SIZE) {
+		vga_mem_write(addr - VGA_WINDOW_BASE, val);
+		return;
+	}
 	cpu_mem_watch(addr, val);
 	memory[addr] = val;
 }

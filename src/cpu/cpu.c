@@ -58,9 +58,17 @@ bool fpu_present_test = true;
 bool cpu_a20_enabled = false;
 bool cpu_is_286 = false;
 bool cpu_reset_pending = false;
+// ★ POST 阶段标志：POST 尚未结束（未第一次 INT 19h 引导）时，AT 的 A20 门强制保持开启，
+//   以免 POST 的扩展内存测试（F000:08F8 对 0x100000 的 rep stos）在 A20 关闭时折回
+//   0x00000，覆盖 BDA/GDT/IDT 导致 triple fault（见 at_post_restart_hook 的说明）。
+//   POST 结束后 A20 交由 XMS/HIMEM 与端口 0x92 / INT 15h AH=24h 自由控制 ——
+//   HIMEM.SYS 的 A20 自检（关 A20 → 验证 1MB 折回 → 再开）必须真正生效，
+//   否则报 "Unable to control A20 line!" 并拒绝安装 XMS 驱动。
+bool cpu_post_done = false;
 
 void cpu_set_a20(bool on) {
-    if (cpu_is_286) on = true;   // ★ AT：A20 门恒开（POST 必须把 ROM 高位区映射到 1MB+，关闭会绕回低内存跑飞）
+    // ★ AT 在 POST 期间恒开 A20（保护 POST 的扩展内存测试）；POST 结束后真实可控。
+    if (cpu_is_286 && !cpu_post_done) on = true;
     cpu_a20_enabled = on;
 }
 void cpu_request_reset(void) {
@@ -200,6 +208,7 @@ void cpu_reset(void) {
     cpu386_reset();
     fpu_reset();          // ★ 复位：回到 CW=037F、栈全空（与真机 RESET 后的 x87 一致）
     cpu_a20_enabled = cpu_is_286;   // AT 上电 A20 已开；XT 无 A20 门（20 位折回）
+    cpu_post_done = false;          // 复位后重新进入 POST 阶段（A20 恒开保护）
 }
 
 
@@ -977,7 +986,7 @@ static bool cpu386_exec_operand32(uint8_t op) {
 //   用途：客机跑飞到数据区报 invalid opcode 时，回溯"它是从哪一步开始跑偏的"。
 //   （定位后删）
 // ============================================================
-#define ITRACE_N 256
+#define ITRACE_N 2048
 static uint16_t itr_cs[ITRACE_N], itr_ip[ITRACE_N];
 static uint8_t  itr_op[ITRACE_N];
 static uint8_t  itr_op2[ITRACE_N];   // 紧跟 opcode 的字节（取 ModR/M，判定 GRP5 控制流）
@@ -992,7 +1001,7 @@ static int      itr_slot_cur = -1;   // 当前这条指令在环内的槽位（-
 //   把"进循环之前究竟从哪来"整段挤掉，是最难排查的情况。
 //   限制同一地址在最近窗口内最多出现 ITR_MAX_DUP 次即可保住循环之前的历史。
 #define ITR_MAX_DUP 2
-#define ITR_WIN     128
+#define ITR_WIN     512
 
 // 控制流指令：IP 推进 ≠ 指令长度，回放比对时跳过
 static bool itr_is_cflow(uint8_t op, uint8_t op2) {
@@ -1151,40 +1160,37 @@ static int insn_len_286(uint32_t lin) {
     }
 }
 
+// 最近 itrace 环形缓冲里 PC（实模式线性 cs*16+ip）的最大-最小跨度；不足 2 条返回 -1。
+int itrace_pc_span(void) {
+    if (itr_count < 2) return -1;
+    uint32_t lo = 0xFFFFFFFFu, hi = 0;
+    for (int k = 0; k < itr_count; k++) {
+        int i = (itr_n + k) % ITRACE_N;
+        uint32_t lin = (uint32_t)itr_cs[i] * 16u + itr_ip[i];
+        if (lin < lo) lo = lin;
+        if (lin > hi) hi = lin;
+    }
+    return (int)(hi - lo);
+}
+
 void cpu_execute_instruction(void) {
     uint32_t addr = cpu_seg_base(cpu.cs) + cpu.ip;
     uint8_t opcode = cpu_mem_read(addr);
     itr_slot_cur = itrace_push(cpu.cs, cpu.ip, opcode, cpu_mem_read(addr + 1));
 
-    // ★ 显卡 ROM / INT 10h 追踪
-    //   1) POST 有没有扫描到并执行显卡选件 ROM（C0000-C7FFF）—— 能执行到说明已被扫描到。
-    //   2) INT 10h 向量每次变化都打出来：落在 C0000-C7FFF = 显卡 ROM 接管；
-    //      若停在 F000 = 主板 BIOS 自带（只认 CGA 模式 0..6，EGA/VGA 模式会被拒）。
-    {
-        static bool rom_ran = false;
-        if (!rom_ran && cpu.cs >= 0xC000 && cpu.cs < 0xC800) {
-            fprintf(stderr, "[VIDEO ROM] POST executing video option ROM: CS=%04X IP=%04X\n",
-                    cpu.cs, cpu.ip);
-            rom_ran = true;
+    // ★ 诊断：实模式下执行到 IVT 区域（线性 < 0x400）几乎必然是被当代码跑的数据
+    //   （本例里 0016:0070 = 线性 0x1D0 = INT 74h 鼠标向量槽）。首次命中即 dump 现场并停机，
+    //   回放里能看到"是从哪一步（哪条远跳转/IRET）进入 IVT 的"。
+    if (!protect.pe) {
+        uint32_t _lin = (uint32_t)(cpu.cs << 4) + cpu.ip;
+        if (_lin < 0x400) {
+            fprintf(stderr, "[IVT-EXEC] entering IVT as code: CS:IP=%04X:%04X lin=%05X op=%02X\n",
+                    cpu.cs, cpu.ip, _lin, opcode);
+            itrace_dump();
+            fflush(stderr);
+            cpu_running = false;
+            return;
         }
-        static uint16_t v_cs = 0, v_ip = 0;
-        uint16_t nip = (uint16_t)(memory[0x40] | (memory[0x41] << 8));
-        uint16_t ncs = (uint16_t)(memory[0x42] | (memory[0x43] << 8));
-        if (ncs != v_cs || nip != v_ip) {
-            fprintf(stderr, "[IVT] INT 10h: %04X:%04X -> %04X:%04X%s\n",
-                    v_cs, v_ip, ncs, nip,
-                    (ncs >= 0xC000 && ncs < 0xC800) ? "  <= taken over by video ROM" : "");
-            v_cs = ncs; v_ip = nip;
-        }
-    }
-
-    if (debug_mode && cpu.cs == 0xF000) {
-        if (cpu.ip == 0x2BB7) fprintf(stderr, "[TRACE] enter diskette test 2bb7 (di=%d)\n", cpu.di);
-        else if (cpu.ip == 0x2BBA) fprintf(stderr, "[TRACE] recal#1 call 2bba\n");
-        else if (cpu.ip == 0x2AA9) fprintf(stderr, "[TRACE] enter seek sub 2aa9 (cl=%d di=%d ch=%d)\n", cpu.cx & 0xFF, cpu.di, (cpu.cx >> 8) & 0xFF);
-        else if (cpu.ip == 0x2ABD) fprintf(stderr, "[TRACE] recal#2 call 2abd\n");
-        else if (cpu.ip == 0x2AEC) fprintf(stderr, "[TRACE] SEEK output 2aec (ah will be 0x%02X)\n", (cpu.ax >> 8) & 0xFF);
-        else if (cpu.ip == 0x2B1F) fprintf(stderr, "[TRACE] wait 2b1f (di=%d)\n", cpu.di);
     }
 
     at_post_restart_hook(addr);   // ★ POST 软重启入口：把 A20 复位成上电默认值
@@ -3099,6 +3105,10 @@ void cpu_fault_dump(const char* kind, uint8_t vector, const char* why) {
 	        cpu.cs, cpu.ip, cpu.ss, cpu.sp, cpu.ds, cpu.es);
 	fprintf(stderr, "[FAULT] AX=%04X BX=%04X CX=%04X DX=%04X SI=%04X DI=%04X BP=%04X FL=%04X\n",
 	        cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.si, cpu.di, cpu.bp, cpu.flags);
+	// ★ 诊断：实模式/保护模式、A20、CS 线性基址，判定是否把 IVT 当代码执行
+	fprintf(stderr, "[FAULT] PE=%d A20=%d CS_base=%08X CS_limit=%08X MSW=%04X\n",
+	        protect.pe ? 1 : 0, cpu_a20_enabled ? 1 : 0,
+	        cpu.seg_base[SEG_CS], cpu.seg_limit[SEG_CS], protect.msw);
 	// 出错指令附近字节（F6/F7 等已把 IP 推进到下一条，故从 IP-6 起打 8 字节，
 	// IP 所指字节用方括号标出）
 	{
@@ -3186,6 +3196,9 @@ void cpu_interrupt(uint8_t int_num) {
 	if (int_num == 0x19) {
 		uint16_t v19 = read_word(0, 0x64);
 		uint16_t s19 = read_word(0, 0x66);
+		// ★ POST 结束：BIOS 的收尾就是 INT 19h 引导，此后 A20 不再强制恒开，
+		//   交由 XMS/HIMEM 与端口 0x92 / INT 15h AH=24h 自由控制。
+		cpu_post_done = true;
 		fprintf(stderr, "[INT19] triggered EAX=%04X EBX=%04X ECX=%04X EDX=%04X ESI=%04X EDI=%04X EBP=%04X ESP=%04X EIP=%04X CS=%04X DS=%04X ES=%04X SS=%04X FS=%04X GS=%04X EFLAGS=%04X\n  int19 vector=%04X:%04X\n",
 		        cpu.eax, cpu.ebx, cpu.ecx, cpu.edx, cpu.esi, cpu.edi, cpu.ebp, cpu.esp,
 		        cpu.eip, cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs, cpu.eflags, s19, v19);
@@ -3201,6 +3214,19 @@ void cpu_interrupt(uint8_t int_num) {
 		cpu.ax = (uint16_t)ext_kb;
 		cpu.flags &= ~1u;            // CF=0 成功
 		return;
+	}
+	// ★ A20 门控制（INT 15h AH=24h）：HIMEM.SYS 与保护模式切换的首选 A20 检测路径。
+	//   AL=00 禁用 A20；AL=01 启用；AL=02 查询状态；AL=03 查询支持能力。
+	//   成功一律 AH=0、CF=0。POST 结束后（cpu_post_done）这些调用才真实改 A20，
+	//   使 HIMEM 的 A20 自检（关 A20 → 验证 1MB 折回 → 再开）成立。
+	if (int_num == 0x15 && cpu.ah == 0x24) {
+		switch (cpu.al) {
+			case 0x00: cpu_set_a20(false); cpu.ax = 0x0000; cpu.flags &= ~1u; return;  // 禁用 A20
+			case 0x01: cpu_set_a20(true);  cpu.ax = 0x0000; cpu.flags &= ~1u; return;  // 启用 A20
+			case 0x02: cpu.ax = (uint16_t)(cpu_a20_enabled ? 0x0001 : 0x0000); cpu.flags &= ~1u; return; // 查询
+			case 0x03: cpu.ax = 0x0000; cpu.bx = 0x0003; cpu.flags &= ~1u; return;     // 支持 2400/2401/2402
+			default: break;   // 其他子功能不拦截，交回 BIOS/IVT
+		}
 	}
 	if (int_num == 0x13) {
 		// ★ 诊断绕过：软盘读(ah=02, dl=0)直接拷镜像扇区并成功返回，

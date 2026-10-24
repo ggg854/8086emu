@@ -96,6 +96,25 @@ static uint8_t  ppi_port_b = 0;
 #define DIP_SW1 0x0D
 #define DIP_SW2 0x04
 
+// ============================================================
+// XT 键盘（经 8255 PPI 端口 A，端口 0x60）—— 与 AT 的 8042 完全不同
+//   参考 D:\downl\src\src\machine.c：
+//     · 0x60 读 = 键盘扫描码（来自设备队列）；0x60 写 = 输出端口 A（忽略）
+//     · 键盘在 PB7(0x61 bit7) 复位脉冲 低→高 释放后，延迟一拍送出 BAT 0xAA 并请求 IRQ1
+//     · XT 没有 0x64（8042）；0xA0 是 NMI 屏蔽字（不是从中片）
+//   这段逻辑只在 !cpu_is_286（XT/8088）时生效，AT 仍走上方 8042 路径。
+// ============================================================
+static uint8_t  xt_ppa = 0;             // PPI 端口 A（0x60 写值，通常给键盘发命令，忽略）
+static uint8_t  xt_ppc = 0;             // PPI 端口 C（0x62 写值）
+static uint8_t  xt_ppctrl = 0x99;       // PPI 控制字（复位初值：A 入 / B 出 / C 出）
+static uint8_t  xt_ppb_old = 0;         // 上次 0x61 写值（检测 PB7 边沿）
+static bool     xt_kbd_low_seen = false; // 已见到 PB7 低电平（复位脉冲起点）
+static bool     xt_kbd_bat_sent = false; // BAT 已送过（只送一次）
+static uint8_t  xt_kbd_reset_delay = 0;  // >0：再等几拍送 BAT 0xAA
+static bool     xt_kbd_irq_pending = false; // 已为当前字节投过 IRQ1
+static uint8_t  xt_kbd_last = 0;        // 空队列时返回的“上次值”
+static uint8_t  xt_nmi_mask = 0;        // 0xA0：NMI / 通道检查屏蔽字
+
 // 键盘缓冲区
 static bool kbd_irq_pending = false;   // 已为当前字节投递过 INT09，等 0x60 读走后才复位
 static uint32_t kbd_stuck_polls = 0;   // 已投递但长时间没被读走的轮询计数（防永久卡死）
@@ -655,6 +674,20 @@ void io_timer_poll(void) {
 // 键盘轮询
 // ============================================================
 void io_keyboard_poll(void) {
+  // ★ XT（8088）键盘：走 8255 PPI，不经过 8042。设备队列里的字节直接经 0x60 读走，
+  //   有新字节（含键盘 BAT 0xAA）就投 IRQ1；下拍把 BAT 推送进队列。
+  if (!cpu_is_286) {
+    if (xt_kbd_reset_delay && --xt_kbd_reset_delay == 0) kbd_push_byte(0xAA);  // 复位脉冲后送 BAT
+    if (kbd_has_data() && !xt_kbd_irq_pending) {
+      if (!pic_irq_masked(1) && get_flag(FLAG_IF) &&
+          vector_installed(pic_irq_vector(1))) {
+        xt_kbd_irq_pending = true;
+        pic_ack(1);
+        cpu_interrupt(pic_irq_vector(1));
+      }
+    }
+    return;
+  }
   // 延迟到期的 8042 命令应答：等够几轮 poll 再放进输出缓冲（见 kbd_schedule_response）
   if (kbd_resp_delay > 0 && --kbd_resp_delay == 0 && !kbd_out_full) {
     kbd_out_buf = kbd_resp_byte;
@@ -1038,8 +1071,18 @@ static void post_fixup_floppy_equip(void) {
 // ============================================================
 // 读端口
 // ============================================================
+// ★ 诊断 IOTRACE：直接写文件 iotrace_port.log，GUI 也能抓（事后删）。
+static FILE* iotr_open(void) {
+  static FILE* f = NULL;
+  if (!f) f = fopen("iotrace_port.log", "w");
+  return f;
+}
 uint8_t io_read_port(uint16_t port) {
   uint8_t ret = 0;
+  // ★ 诊断 IOTRACE：打印嫌疑端口（DMA/PIT/键盘）的读，定位 XT BIOS 卡死。事后删。
+  static int g_iotr = -1;
+  if (g_iotr < 0) g_iotr = getenv("IOTRACE") ? 1 : 0;
+  bool iotr_r = g_iotr && (port < 0x10 || (port >= 0x40 && port <= 0x43) || (port >= 0x60 && port <= 0x64));
   switch (port) {
     // ---- DMA ----
     case 0x00: case 0x01: case 0x02: case 0x03:
@@ -1065,8 +1108,9 @@ uint8_t io_read_port(uint16_t port) {
     //   命令口按 OCW3 选择读 IRR / ISR（未选择时读 IRR）；数据口读 IMR。
     case 0x20: ret = pic_m.read_isr ? pic_m.isr : pic_m.irr; break;
     case 0x21: ret = pic_m.imr; break;
-    case 0xA0: ret = pic_s.read_isr ? pic_s.isr : pic_s.irr; break;
-    case 0xA1: ret = pic_s.imr; break;
+    // ★ XT 只有主片，0xA0 是 NMI/通道检查屏蔽字（不是从中片）；AT 才是从中片
+    case 0xA0: ret = cpu_is_286 ? (pic_s.read_isr ? pic_s.isr : pic_s.irr) : xt_nmi_mask; break;
+    case 0xA1: ret = cpu_is_286 ? pic_s.imr : 0xFF; break;
 
     // ---- PIT ----
     // 读回当前计数值（低字节）。计数器由 io_pit_step() 每条指令递减，
@@ -1102,17 +1146,30 @@ uint8_t io_read_port(uint16_t port) {
     }
     case 0x43: ret = 0x00; break;
 
-    // ---- 8042 键盘 ----
+    // ---- 0x60：XT 是 8255 PPI 端口 A（键盘数据）/ AT 是 8042 输出缓冲 ----
     case 0x60: {
-      ret = kbd_out_buf;
-      kbd_out_full = false;
-      kbd_out_buf = 0;
-      kbd_out_aux = false;
-      kbd_irq_pending = false;         // 中断已消费，可以投递下一个字节
-      if (debug_mode) printf("[KBD] read 0x60=%02X\n", ret);
+      if (!cpu_is_286) {
+        // XT：从设备队列取扫描码（键盘 BAT 0xAA、用户输入都在这里）
+        if (kbd_head != kbd_tail) {
+          xt_kbd_last = kbd_pop_byte();
+          if (kbd_head == kbd_tail) xt_kbd_irq_pending = false;  // 队空：可再投下一字节
+        }
+        ret = xt_kbd_last;
+      } else {
+        ret = kbd_out_buf;
+        kbd_out_full = false;
+        kbd_out_buf = 0;
+        kbd_out_aux = false;
+        kbd_irq_pending = false;         // 中断已消费，可以投递下一个字节
+        if (debug_mode) printf("[KBD] read 0x60=%02X\n", ret);
+      }
       break;
     }
     case 0x64: {
+      if (!cpu_is_286) {
+        ret = 0xFF;                                // XT 无 8042，端口未实现
+        break;
+      }
       // 状态寄存器：
       // bit0 = 输出缓冲满（有数据可读）
       // bit1 = 输入缓冲满（写命令后短暂为 1）
@@ -1285,6 +1342,7 @@ uint8_t io_read_port(uint16_t port) {
     }
   }
 
+  if (iotr_r) { FILE* f = iotr_open(); if (f) { fprintf(f, "[IO.R] %03X=%02X\n", port, ret); fflush(f); } }
   return ret;
 }
 
@@ -1292,6 +1350,11 @@ uint8_t io_read_port(uint16_t port) {
 // 写端口
 // ============================================================
 void io_write_port(uint16_t port, uint8_t val) {
+  // ★ 诊断 IOTRACE（与读共用开关）
+  static int g_iotw = -1;
+  if (g_iotw < 0) g_iotw = getenv("IOTRACE") ? 1 : 0;
+  bool iotr_w = g_iotw && (port < 0x10 || (port >= 0x40 && port <= 0x43) || (port >= 0x60 && port <= 0x64));
+  if (iotr_w) { FILE* f = iotr_open(); if (f) { fprintf(f, "[IO.W] %03X<=%02X\n", port, val); fflush(f); } }
   switch (port) {
     // ---- DMA ----
     case 0x00: case 0x01: case 0x02: case 0x03:
@@ -1314,10 +1377,17 @@ void io_write_port(uint16_t port, uint8_t val) {
       break;
 
     // ---- PIC ----
+    //   ★ XT 只有主片 0x20/0x21；0xA0 在 XT 上是 NMI/通道检查屏蔽字（不是从中片）。
     case 0x20: pic_write_cmd(&pic_m, val); break;
     case 0x21: pic_write_data(&pic_m, val); break;
-    case 0xA0: pic_write_cmd(&pic_s, val); break;
-    case 0xA1: pic_write_data(&pic_s, val); break;
+    case 0xA0:
+      if (cpu_is_286) pic_write_cmd(&pic_s, val);
+      else xt_nmi_mask = val;          // XT：NMI 屏蔽字
+      break;
+    case 0xA1:
+      if (cpu_is_286) pic_write_data(&pic_s, val);
+      // XT：0xA1 不存在，写操作忽略
+      break;
 
     // ---- PIT ----
     case 0x40: case 0x41: case 0x42: case 0x43:
@@ -1368,8 +1438,12 @@ void io_write_port(uint16_t port, uint8_t val) {
       break;
     }
 
-    // ---- 8042 键盘 ----
+    // ---- 0x60：XT = 8255 PPI 端口 A（键盘数据）/ AT = 8042 输出缓冲 ----
     case 0x60: {
+      if (!cpu_is_286) {
+        xt_ppa = val;                  // PPI A 输出端口：给键盘发命令（XT 忽略其内容）
+        break;
+      }
       kbd_in_full = true;
       switch (kbd_wait) {
         case W_CFG:                          // 0x64=0x60 之后的命令字节
@@ -1379,6 +1453,11 @@ void io_write_port(uint16_t port, uint8_t val) {
         case W_OUTPORT:                      // 0x64=0xD1 之后的输出端口值
           kbd_out_port = val;
           cpu_set_a20((val & 0x02) != 0);    // bit1 = A20 门（AT 的 8042 打开路径）
+          // bit0 = 系统复位（低有效）：AT BIOS 在 286 保护模式自检里写完内存测试，
+          // 靠写 0x60=0x00 脉冲 CPU RESET 线回到实模式（RAM 保留、0x472/CMOS 0x0F
+          // 记录热启动点，复位后 POST 从断点续跑）。我们只在 bit0=0 时请求复位，
+          // bit0=1（仅开 A20、如 0x03/0xDF）不复位。
+          if ((val & 0x01) == 0) cpu_request_reset();
           kbd_wait = W_NONE;
           break;
         case W_AUX:                          // 0x64=0xD4 之后：发给鼠标设备
@@ -1395,6 +1474,7 @@ void io_write_port(uint16_t port, uint8_t val) {
       break;
     }
     case 0x64: {
+      if (!cpu_is_286) break;          // XT 无 8042，端口未实现
       if (debug_mode) printf("[KBD] write 0x64=%02X\n", val);
       kbd_in_full = true;
       switch (val) {
@@ -1542,12 +1622,34 @@ void io_write_port(uint16_t port, uint8_t val) {
       break;
 
     // ---- 8255 端口 B ----
-    case 0x61: ppi_port_b = val; break;
+    case 0x61: {
+      if (!cpu_is_286) {
+        // XT：PB7 是键盘时钟/复位。低→高 释放复位后，键盘送出 BAT 0xAA（延迟一拍）。
+        // 参考 D:\downl\src\src\machine.c：kbd_reset_delay 在主循环递减到 0 时 push 0xAA。
+        if (!(val & 0x80) && (xt_ppb_old & 0x80)) {
+          xt_kbd_low_seen = true;             // 见到 PB7 低电平（复位脉冲起点）
+          xt_kbd_last = 0;
+        }
+        if ((val & 0x80) && !(xt_ppb_old & 0x80)) {
+          if (xt_kbd_low_seen && !xt_kbd_bat_sent) {
+            xt_kbd_bat_sent = true;
+            xt_kbd_reset_delay = 2;           // 下一拍送 BAT 0xAA
+          }
+          xt_kbd_low_seen = false;
+        }
+        xt_ppb_old = val;
+      }
+      ppi_port_b = val;
+      break;
+    }
+    // ---- 8255 端口 C（DIP 选择 / 输出）与 控制寄存器（XT 同 AT 都是 PPI）----
+    case 0x62: xt_ppc = val; break;
+    case 0x63: xt_ppctrl = val; break;
 
+    // ---- 系统控制端口 A（bit1 = A20 门；POST 结束后真实控制）----
     case 0x92:
-    
-    cpu_set_a20((val & 0x02) != 0);
-    break;
+      cpu_set_a20((val & 0x02) != 0);
+      break;
 
     // ---- 串口 COM1（真 8250 寄存器）----
     case 0x3F8: case 0x3F9: case 0x3FA:
@@ -1605,6 +1707,11 @@ void io_reset(void) {
   ms_state = MS_IDLE; ms_enabled = false; ms_sample = 0x64; ms_res = 2;
   ms_buttons = 0; ms_dx = 0; ms_dy = 0;
   ppi_port_b = 0;
+  // ---- XT 键盘 / PPI / NMI 复位初值（参考 reference machine.c: xt_reset）----
+  xt_ppa = 0; xt_ppc = 0; xt_ppctrl = 0x99;
+  xt_ppb_old = 0; xt_kbd_low_seen = false; xt_kbd_bat_sent = false;
+  xt_kbd_reset_delay = 0; xt_kbd_irq_pending = false; xt_kbd_last = 0;
+  xt_nmi_mask = 0;
   pic_m = (PIC8259){ 0, 0, 0x00, 0x08, 0x00, false, false, 0, false, false };
   pic_s = (PIC8259){ 0, 0, 0xFF, 0x70, 0x00, false, false, 0, false, false };
   for (int i = 0; i < 3; i++) {

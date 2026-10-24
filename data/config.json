@@ -1,10 +1,11 @@
 {
   "bios":"D:\\dos86\\data\\IBMATBIOS.BIN",
   "disk":"",
-  "floppy_a":"C:\\Users\\ASUS\\Desktop\\DISK01.IMG",
+  "floppy_a":"D:\\dos86\\data\\ega.img",
   "floppy_b":"D:\\downl\\8088mph.360",
   "cpu_mhz":20,
+  "ram_mb":0,
   "composite":true,
-  "console":false,
+  "console":true,
   "debug":false
 }
