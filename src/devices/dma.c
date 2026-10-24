@@ -233,7 +233,8 @@ static void    dma_bus_write(void* ctx, uint16_t port, uint8_t val) { (void)ctx;
 
 void dma_register_bus(Bus* bus) {
   bus_register(bus, "dma",       NULL, dma_bus_read, dma_bus_write, 0x00, 0x10);  // 0x00-0x0F 主片寄存器
-  bus_register(bus, "dma-page",  NULL, dma_bus_read, dma_bus_write, 0x80, 0x10);  // 0x80-0x8F 页寄存器
+  // 注意：0x80 是 POST 诊断口（不是 DMA 页寄存器），绝不能认领；页寄存器是 0x81-0x8F。
+  bus_register(bus, "dma-page",  NULL, dma_bus_read, dma_bus_write, 0x81, 0x0F);  // 0x81-0x8F 页寄存器
   bus_register(bus, "dma-slave", NULL, dma_bus_read, dma_bus_write, 0xC0, 0x20);  // 0xC0-0xDF 从片寄存器+页寄存器
 }
 // ============================================================
