@@ -9,8 +9,20 @@
 #include "fdc.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 #include <time.h>
 #include <sys/time.h>          // gettimeofday：用于 RTC 的 UIP 周期性翻转
+
+// 键盘输入诊断：始终写入固定文件 d:/dos86/_kbd_trace.log（每次运行首次调用清空）。
+// 事件稀疏（每按键 / 每次 INT 09h 读 0x60），开销可忽略；用于定位“无法输入”断点。
+static void kbd_trace(const char* fmt, ...) {
+  static int first = 1;
+  FILE* f = fopen("d:/dos86/_kbd_trace.log", first ? "w" : "a");
+  first = 0;
+  if (!f) return;
+  va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+  fclose(f);
+}
 
 // ============================================================
 // 8042 键盘控制器（PS/2 键盘 + PS/2 鼠标）
@@ -431,9 +443,8 @@ static void uart_write_reg(uint16_t port, uint8_t v) {
 // 主机侧键盘输入（GTK 事件 → 设备队列）
 // ============================================================
 void io_keyboard_push(uint8_t scancode) {
-  static int ktr = -1; if (ktr < 0) ktr = getenv("KBDTRACE") ? 1 : 0;
   bool en = kbd_enabled_now();
-  if (ktr) fprintf(stderr, "[KBD] push %02X enabled=%d is286=%d\n", scancode, en, cpu_is_286);
+  kbd_trace("[KBD] push %02X enabled=%d is286=%d\n", scancode, en, cpu_is_286);
   if (!en) return;       // 扫描被 0xF5 或命令字节 bit4 禁止
   kbd_push_byte(scancode);
   vga_led_activity(3);              // 键盘读写灯：按一下就闪
@@ -683,18 +694,21 @@ void io_keyboard_poll(void) {
   if (!cpu_is_286) {
     if (xt_kbd_reset_delay && --xt_kbd_reset_delay == 0) kbd_push_byte(0xAA);  // 复位脉冲后送 BAT
     if (kbd_has_data() && !xt_kbd_irq_pending) {
-      static int ktr = -1; if (ktr < 0) ktr = getenv("KBDTRACE") ? 1 : 0;
       bool msk = pic_irq_masked(1), ifl = get_flag(FLAG_IF),
            vi = vector_installed(pic_irq_vector(1));
       if (!msk && ifl && vi) {
         xt_kbd_irq_pending = true;
         pic_ack(1);
         cpu_interrupt(pic_irq_vector(1));
-        if (ktr) fprintf(stderr, "[KBD] IRQ1 -> INT %02X\n", pic_irq_vector(1));
-      } else if (ktr) {
-        fprintf(stderr, "[KBD] IRQ1 blocked: masked=%d IF=%d vec_inst=%d vec=%02X qlen=%d\n",
-                msk, ifl, vi, pic_irq_vector(1),
-                (kbd_tail - kbd_head + KBD_BUF_SIZE) % KBD_BUF_SIZE);
+        kbd_trace("[KBD] IRQ1 -> INT %02X\n", pic_irq_vector(1));
+      } else {
+        static int blocked_logged = 0;   // 只记第一次阻塞原因，避免每 poll 都写
+        if (!blocked_logged) {
+          blocked_logged = 1;
+          kbd_trace("[KBD] IRQ1 blocked: masked=%d IF=%d vec_inst=%d vec=%02X qlen=%d\n",
+                    msk, ifl, vi, pic_irq_vector(1),
+                    (kbd_tail - kbd_head + KBD_BUF_SIZE) % KBD_BUF_SIZE);
+        }
       }
     }
     return;
@@ -1181,8 +1195,7 @@ static uint8_t legacy_read(void* ctx, uint16_t port) {
         }
         xt_kbd_irq_pending = false;
         ret = xt_kbd_last;
-        { static int ktr = -1; if (ktr < 0) ktr = getenv("KBDTRACE") ? 1 : 0;
-          if (ktr) fprintf(stderr, "[KBD] read 0x60 -> %02X\n", ret); }
+        kbd_trace("[KBD] read 0x60 -> %02X\n", ret);
       } else {
         ret = kbd_out_buf;
         kbd_out_full = false;
