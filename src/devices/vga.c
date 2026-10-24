@@ -3,6 +3,7 @@
 #include "cpu.h"
 #include "io.h"
 #include "font8x16.h"
+#include "cga_font_8x8.h"
 #include "vga_rom_vga.h"
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,26 @@ bool vga_mem_window_active = false;
 // 位平面显存的行跨距（字节）：由 CRTC Offset 寄存器(0x13)推导，见 vga_update_mode。
 //   正常模式它就是"显示宽度/8"；驱动做虚拟桌面时会被设得更大，必须按它走。
 static int vga_plane_stride = 80;
+
+// ---- 字库选择：VGA 8x16（默认）或 CGA 8x8（authentic IBM CGA 字符 ROM）----
+//   文本渲染按 16 行/字符走；选 CGA 时把 8x8 字形放到每个单元格的上 8 行（下 8 行留空）。
+//   与 src/xt 驱动的 CGA/VGA 二选一概念一致，由 config 的 font 字段驱动。
+static int vga_font_cga = 0;
+
+static void vga_apply_font(void) {
+  init_font();                         // 默认：VGA 8x16
+  if (vga_font_cga) {
+    memset(font8x16, 0, sizeof(font8x16));
+    for (int c = 0; c < 256; c++)
+      for (int i = 0; i < 8; i++)
+        font8x16[c][i] = cga_font_8x8[c * 8 + i];   // CGA 8x8 → 上 8 行
+  }
+}
+
+void vga_set_font_cga(int on) {
+  vga_font_cga = on ? 1 : 0;
+  vga_apply_font();
+}
 
 // VGA 端口寄存器
 uint8_t vga_seq_regs[8] = {0};
@@ -335,7 +356,7 @@ void vga_init(int argc, char** argv) {
     vga.surface = cairo_image_surface_create_for_data(
         (unsigned char*)vga.pixels, CAIRO_FORMAT_RGB24,
         vga.width, vga.height, vga.width * sizeof(uint32_t));
-    init_font();
+    vga_apply_font();
     vga_set_default_palette();
     memset(vga_seq_regs, 0, sizeof(vga_seq_regs));
     memset(vga_gc_regs, 0, sizeof(vga_gc_regs));
@@ -426,7 +447,7 @@ void vga_init(int argc, char** argv) {
     vga.height,
     vga.width * sizeof(uint32_t));
 
-  init_font();
+  vga_apply_font();
   vga_set_default_palette();
   memset(vga_seq_regs, 0, sizeof(vga_seq_regs));
   memset(vga_gc_regs, 0, sizeof(vga_gc_regs));

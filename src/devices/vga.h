@@ -76,6 +76,10 @@ int     vga_current_scanline(void);
 //   打开后 CGA 各模式按复合信号解调出颜色，而不是直接用 RGBI 直接色。
 void vga_set_composite(bool on);
 
+// 字库选择：on=1 用 authentic CGA 8x8 字符 ROM；on=0 用 VGA 8x16（默认）。
+// 由 config 的 font 字段（"cga"/"vga"）在 init_emulator 里调用。
+void vga_set_font_cga(int on);
+
 gboolean vga_on_draw(GtkWidget* widget, cairo_t* cr, gpointer data);
 gboolean vga_on_key_press(GtkWidget* widget, GdkEventKey* event, gpointer data);
 gboolean vga_on_key_release(GtkWidget* widget, GdkEventKey* event, gpointer data);

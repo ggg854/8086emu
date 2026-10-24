@@ -15,6 +15,7 @@ typedef struct {
     int  cpu_mhz;
     int  ram_mb;     // 内存容量（MB），"随便调"：1..256，缺省 8
     bool composite;
+    char font[16];   // 字库选择："vga"（默认，8x16）或 "cga"（authentic 8x8）
     bool console;
     bool debug;
 } Config;

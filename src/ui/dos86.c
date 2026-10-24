@@ -951,6 +951,7 @@ void init_emulator(const Config* cfg) {
 
     vga_clear(0x07);
     vga_set_composite(cfg->composite);
+    vga_set_font_cga(strcmp(cfg->font, "cga") == 0);   // 字库选择：config 的 font 字段（vga/cga）
     cpu_clk_hz = (uint32_t)(cfg->cpu_mhz ? cfg->cpu_mhz : 20) * 1000000;
 
     if (cfg->console) return;

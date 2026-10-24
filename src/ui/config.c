@@ -42,6 +42,9 @@ bool config_load(const char* path, Config* c) {
         c->ram_mb = json_object_get_int(v);
     if (json_object_object_get_ex(root, "composite", &v))
         c->composite = json_object_get_boolean(v);
+    strncpy(c->font, "vga", sizeof(c->font) - 1);   // 默认 VGA 8x16
+    if (json_object_object_get_ex(root, "font", &v) && json_object_get_string(v))
+        strncpy(c->font, json_object_get_string(v), sizeof(c->font) - 1);
     if (json_object_object_get_ex(root, "console", &v))
         c->console = json_object_get_boolean(v);
     if (json_object_object_get_ex(root, "debug", &v))
@@ -62,6 +65,7 @@ bool config_save(const char* path, const Config* c) {
     json_object_object_add(root, "cpu_mhz", json_object_new_int(c->cpu_mhz));
     json_object_object_add(root, "ram_mb", json_object_new_int(c->ram_mb));
     json_object_object_add(root, "composite", json_object_new_boolean(c->composite));
+    json_object_object_add(root, "font", json_object_new_string(c->font[0] ? c->font : "vga"));
     json_object_object_add(root, "console", json_object_new_boolean(c->console));
     json_object_object_add(root, "debug", json_object_new_boolean(c->debug));
 
@@ -200,6 +204,16 @@ bool config_dialog(Config* c) {
     gtk_grid_attach(GTK_GRID(grid), chk_comp, 1, row, 1, 1);
     row++;
 
+    GtkWidget* lbl_font = gtk_label_new("Font:");
+    gtk_widget_set_halign(lbl_font, GTK_ALIGN_START);
+    GtkWidget* cmb_font = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(cmb_font), "VGA 8x16");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(cmb_font), "CGA 8x8");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(cmb_font), strcmp(c->font, "cga") == 0 ? 1 : 0);
+    gtk_grid_attach(GTK_GRID(grid), lbl_font, 0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), cmb_font, 1, row, 1, 1);
+    row++;
+
     GtkWidget* chk_dbg = gtk_check_button_new_with_label("Debug log");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(chk_dbg), c->debug);
     gtk_grid_attach(GTK_GRID(grid), chk_dbg, 1, row, 1, 1);
@@ -216,6 +230,7 @@ bool config_dialog(Config* c) {
         strncpy(c->floppy_b, gtk_entry_get_text(GTK_ENTRY(ent_fb)),   sizeof(c->floppy_b) - 1);
         c->cpu_mhz   = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spin_mhz));
         c->composite = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(chk_comp));
+        strncpy(c->font, gtk_combo_box_get_active(GTK_COMBO_BOX(cmb_font)) == 1 ? "cga" : "vga", sizeof(c->font) - 1);
         c->debug     = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(chk_dbg));
     }
     gtk_widget_destroy(dlg);
@@ -360,6 +375,16 @@ bool machine_edit_dialog(Config* c, char* name_buf, size_t name_bufsz, bool is_n
     gtk_grid_attach(GTK_GRID(grid), chk_comp, 1, row, 1, 1);
     row++;
 
+    GtkWidget* lbl_font = gtk_label_new("字库 (font):");
+    gtk_widget_set_halign(lbl_font, GTK_ALIGN_START);
+    GtkWidget* cmb_font = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(cmb_font), "VGA 8x16");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(cmb_font), "CGA 8x8");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(cmb_font), strcmp(c->font, "cga") == 0 ? 1 : 0);
+    gtk_grid_attach(GTK_GRID(grid), lbl_font, 0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), cmb_font, 1, row, 1, 1);
+    row++;
+
     GtkWidget* chk_dbg = gtk_check_button_new_with_label("调试日志 (debug)");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(chk_dbg), c->debug);
     gtk_grid_attach(GTK_GRID(grid), chk_dbg, 1, row, 1, 1);
@@ -392,6 +417,7 @@ bool machine_edit_dialog(Config* c, char* name_buf, size_t name_bufsz, bool is_n
         c->ram_mb    = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spin_ram));
         c->cpu_mhz   = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spin_mhz));
         c->composite = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(chk_comp));
+        strncpy(c->font, gtk_combo_box_get_active(GTK_COMBO_BOX(cmb_font)) == 1 ? "cga" : "vga", sizeof(c->font) - 1);
         c->debug     = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(chk_dbg));
         break;
     }
