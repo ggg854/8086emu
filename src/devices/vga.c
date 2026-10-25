@@ -80,6 +80,104 @@ static void on_set_freq(GtkWidget* w, gpointer data) {
   if (vga.drawing_area) gtk_widget_grab_focus(vga.drawing_area);
 }
 
+// ---- 屏幕键盘（软键盘）：鼠标点按直接发 set-1 扫描码给客机 ----
+//   按钮不抢焦点、窗口不接焦点，真实键盘仍可照常用；按下发 make、松开发 break（与真键盘一致）。
+//   在软键盘窗口内任意处松手都补发一次 break，避免按下后拖出按钮不松手导致键卡住。
+static GtkWidget* osk_window = NULL;
+static uint8_t   osk_held   = 0;   // 当前按住的键（防卡键）
+
+typedef struct { const char* label; uint8_t sc; int w; } OskKey;
+
+static void osk_send_make(uint8_t sc)  { if (sc) { io_keyboard_push(sc); osk_held = sc; } }
+static void osk_send_break(uint8_t sc) { if (sc) io_keyboard_push_release(sc); if (osk_held == sc) osk_held = 0; }
+
+static void osk_on_press(GtkButton* b, gpointer d) {
+    (void)d;
+    osk_send_make((uint8_t)GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "osk_sc")));
+}
+static void osk_on_release(GtkButton* b, gpointer d) {
+    (void)d;
+    osk_send_break((uint8_t)GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "osk_sc")));
+}
+// 在软键盘窗口内任意处松手都补发 break（覆盖"按下后拖出按钮"的情况）
+static gboolean osk_win_release(GtkWidget* w, GdkEventButton* e, gpointer d) {
+    (void)w; (void)e; (void)d;
+    if (osk_held) { io_keyboard_push_release(osk_held); osk_held = 0; }
+    return FALSE;
+}
+
+static const OskKey osk_func[] = {
+    {"Esc",0x01,1},{"F1",0x3B,1},{"F2",0x3C,1},{"F3",0x3D,1},{"F4",0x3E,1},
+    {"F5",0x3F,1},{"F6",0x40,1},{"F7",0x41,1},{"F8",0x42,1},
+    {"F9",0x43,1},{"F10",0x44,1},{"F11",0x57,1},{"F12",0x58,1},{NULL,0,0}
+};
+static const OskKey osk_num[] = {
+    {"`",0x29,1},{"1",0x02,1},{"2",0x03,1},{"3",0x04,1},{"4",0x05,1},
+    {"5",0x06,1},{"6",0x07,1},{"7",0x08,1},{"8",0x09,1},{"9",0x0A,1},
+    {"0",0x0B,1},{"-",0x0C,1},{"=",0x0D,1},{"Bksp",0x0E,2},{NULL,0,0}
+};
+static const OskKey osk_q[] = {
+    {"Tab",0x0F,2},{"Q",0x10,1},{"W",0x11,1},{"E",0x12,1},{"R",0x13,1},{"T",0x14,1},
+    {"Y",0x15,1},{"U",0x16,1},{"I",0x17,1},{"O",0x18,1},{"P",0x19,1},
+    {"[",0x1A,1},{"]",0x1B,1},{"\\",0x2B,1},{NULL,0,0}
+};
+static const OskKey osk_a[] = {
+    {"Caps",0x3A,2},{"A",0x1E,1},{"S",0x1F,1},{"D",0x20,1},{"F",0x21,1},{"G",0x22,1},
+    {"H",0x23,1},{"J",0x24,1},{"K",0x25,1},{"L",0x26,1},{";",0x27,1},{"'",0x28,1},
+    {"Enter",0x1C,2},{NULL,0,0}
+};
+static const OskKey osk_z[] = {
+    {"Shift",0x2A,3},{"Z",0x2C,1},{"X",0x2D,1},{"C",0x2E,1},{"V",0x2F,1},{"B",0x30,1},
+    {"N",0x31,1},{"M",0x32,1},{",",0x33,1},{".",0x34,1},{"/",0x35,1},
+    {"Shift",0x36,3},{NULL,0,0}
+};
+static const OskKey osk_bot[] = {
+    {"Ctrl",0x1D,2},{"Alt",0x38,2},{"Space",0x39,6},{"AltGr",0x38,2},{"Ctrl",0x1D,2},{NULL,0,0}
+};
+static const OskKey osk_arrow[] = {
+    {"↑",0x48,1},{"←",0x4B,1},{"↓",0x50,1},{"→",0x4D,1},
+    {"Ins",0x52,1},{"Del",0x53,1},{"Home",0x47,1},{"End",0x4F,1},{"PgUp",0x49,1},{"PgDn",0x51,1},{NULL,0,0}
+};
+
+static void osk_build(void) {
+    osk_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(osk_window), "屏幕键盘");
+    // 不抢主窗口键盘焦点：真实键盘仍送达客机，软键盘只负责鼠标点按
+    gtk_window_set_accept_focus(GTK_WINDOW(osk_window), FALSE);
+    gtk_window_set_focus_on_map(GTK_WINDOW(osk_window), FALSE);
+    if (vga.window) gtk_window_set_transient_for(GTK_WINDOW(osk_window), GTK_WINDOW(vga.window));
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    gtk_container_set_border_width(GTK_CONTAINER(osk_window), 6);
+
+    static const OskKey* rows[] = { osk_func, osk_num, osk_q, osk_a, osk_z, osk_bot, osk_arrow, NULL };
+    const int unit = 30;
+    for (int r = 0; rows[r]; r++) {
+        GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+        for (int i = 0; rows[r][i].label; i++) {
+            int w = rows[r][i].w ? rows[r][i].w : 1;
+            GtkWidget* b = gtk_button_new_with_label(rows[r][i].label);
+            gtk_widget_set_can_focus(b, FALSE);
+            gtk_widget_set_size_request(b, w * unit, 34);
+            g_object_set_data(G_OBJECT(b), "osk_sc", GINT_TO_POINTER((int)rows[r][i].sc));
+            g_signal_connect(b, "pressed",  G_CALLBACK(osk_on_press),   NULL);
+            g_signal_connect(b, "released", G_CALLBACK(osk_on_release), NULL);
+            gtk_box_pack_start(GTK_BOX(hbox), b, FALSE, FALSE, 0);
+        }
+        gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
+    }
+    gtk_container_add(GTK_CONTAINER(osk_window), vbox);
+    g_signal_connect(osk_window, "button-release-event", G_CALLBACK(osk_win_release), NULL);
+    // 关闭窗口只是隐藏，可再次从菜单打开
+    g_signal_connect(osk_window, "delete-event", G_CALLBACK(gtk_widget_hide_on_delete), NULL);
+}
+
+static void on_toggle_osk(GtkWidget* w, gpointer d) {
+    (void)w; (void)d;
+    if (!osk_window) osk_build();
+    if (gtk_widget_get_visible(osk_window)) gtk_widget_hide(osk_window);
+    else gtk_widget_show_all(osk_window);
+}
+
 // 频率预设：CPU 型号 + 主频（标签按用户习惯写成"型号 频率"）
 static const struct { const char* label; uint32_t hz; } freq_presets[] = {
   { "8086  4.77 MHz",       4772720u  },
@@ -412,6 +510,10 @@ void vga_init(int argc, char** argv) {
   gtk_menu_shell_append(GTK_MENU_SHELL(menu_machine), it_b);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu_machine), gtk_separator_menu_item_new());
   gtk_menu_shell_append(GTK_MENU_SHELL(menu_machine), it_r);
+  // 屏幕键盘（软键盘）：鼠标点按送扫描码
+  GtkWidget* it_kbd = gtk_menu_item_new_with_label("屏幕键盘");
+  gtk_menu_shell_append(GTK_MENU_SHELL(menu_machine), it_kbd);
+  g_signal_connect(it_kbd, "activate", G_CALLBACK(on_toggle_osk), NULL);
   g_signal_connect(it_a, "activate", G_CALLBACK(on_mount_floppy), GINT_TO_POINTER(0));
   g_signal_connect(it_b, "activate", G_CALLBACK(on_mount_floppy), GINT_TO_POINTER(1));
   g_signal_connect(it_r, "activate", G_CALLBACK(on_reset_machine), NULL);
