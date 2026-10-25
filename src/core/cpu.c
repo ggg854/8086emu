@@ -33,6 +33,10 @@ uint32_t cpu_last_cycles = 0;
 // 是否正在投递异常处理程序（用于双重/三重故障判定）；IRET 时清零
 static int in_fault = 0;
 
+// 故障指令长度计算（供空向量桩跳过故障指令）；函数体见 cpu_exception 之前
+static uint16_t modrm_disp_len(uint8_t m);
+static uint16_t fault_instr_len(uint16_t cs, uint16_t ip);
+
 // 上一条已执行指令的入口 CS:IP。仅 2 个变量（非 itrace 环形缓冲），
 // 用于故障/跑飞时定位"是从哪一条指令跳过来的"。
 static uint16_t dbg_prev_cs = 0, dbg_prev_ip = 0;
@@ -2506,7 +2510,7 @@ case 0xC6: {
         // AAM (0xD4)
         case 0xD4: {
             uint8_t base = cpu_mem_read(addr + 1);
-            if (base == 0) { cpu.ip += 2; cpu_exception(0, "AAM 基数为 0（等同于除零）"); break; }
+            if (base == 0) { cpu_exception(0, "AAM 基数为 0（等同于除零）"); break; }
             uint8_t al = cpu.ax & 0xFF;
             cpu.ax = ((al / base) << 8) | (al % base);
             update_logic_flags8(cpu.ax & 0xFF);
@@ -2535,10 +2539,11 @@ case 0xC6: {
             uint8_t modrm = cpu_mem_read(addr + 1);
             uint8_t op = (modrm >> 3) & 0x07;
             uint8_t a = read_modrm8(modrm);
-            cpu.ip += 2; handle_modrm_ip(modrm);
+            bool faulted = false;
             switch (op) {
                 case 0: {
-                    uint8_t imm = read_byte(cpu.cs, cpu.ip);   // ★ 立即数在 CS:IP，不是物理地址
+                    // 立即数位于 opcode+modrm+disp 之后；本处尚未推进 IP，故按 opcode 偏移计算
+                    uint8_t imm = read_byte(cpu.cs, (uint16_t)(cpu.ip + 2 + modrm_disp_len(modrm)));
                     uint8_t result = a & imm;
                     update_logic_flags8(result);
                     cpu.ip += 1; break;
@@ -2560,20 +2565,21 @@ case 0xC6: {
                 case 6: {
                     // DIV r/m8：AX / r/m8 → 商 AL，余数 AH
                     uint16_t al = cpu.ax;
-                    if (a == 0) { cpu_exception(0, "DIV r/m8 除数为 0"); break; }
+                    if (a == 0) { cpu_exception(0, "DIV r/m8 除数为 0"); faulted = true; break; }
                     uint16_t q = al / a;
-                    if (q > 0xFF) { cpu_exception(0, "DIV r/m8 商溢出（>0xFF）"); break; }
+                    if (q > 0xFF) { cpu_exception(0, "DIV r/m8 商溢出（>0xFF）"); faulted = true; break; }
                     cpu.ax = ((al % a) << 8) | (q & 0xFF); break;
                 }
                 case 7: {
                     // IDIV r/m8：AX / r/m8（有符号）→ 商 AL，余数 AH
                     int16_t al = (int16_t)cpu.ax;
-                    if (a == 0) { cpu_exception(0, "IDIV r/m8 除数为 0"); break; }
+                    if (a == 0) { cpu_exception(0, "IDIV r/m8 除数为 0"); faulted = true; break; }
                     int16_t q = al / (int8_t)a;
-                    if (q > 127 || q < -128) { cpu_exception(0, "IDIV r/m8 商溢出"); break; }
+                    if (q > 127 || q < -128) { cpu_exception(0, "IDIV r/m8 商溢出"); faulted = true; break; }
                     cpu.ax = (((al % (int8_t)a) & 0xFF) << 8) | (q & 0xFF); break;
                 }
             }
+            if (!faulted) { cpu.ip += 2; handle_modrm_ip(modrm); }
             break;
         }
 
@@ -2582,10 +2588,11 @@ case 0xC6: {
             uint8_t modrm = cpu_mem_read(addr + 1);
             uint8_t op = (modrm >> 3) & 0x07;
             uint16_t a = read_modrm16(modrm);
-            cpu.ip += 2; handle_modrm_ip(modrm);
+            bool faulted = false;
             switch (op) {
                 case 0: {
-                    uint16_t imm = read_word(cpu.cs, cpu.ip);
+                    // 立即数位于 opcode+modrm+disp 之后；本处尚未推进 IP，故按 opcode 偏移计算
+                    uint16_t imm = read_word(cpu.cs, (uint16_t)(cpu.ip + 2 + modrm_disp_len(modrm)));
                     uint16_t result = a & imm;
                     update_logic_flags16(result);
                     cpu.ip += 2; break;
@@ -2609,22 +2616,23 @@ case 0xC6: {
                 case 6: {
                     // DIV r/m16：DX:AX / r/m16 → 商 AX，余数 DX
                     uint32_t dividend = ((uint32_t)cpu.dx << 16) | cpu.ax;
-                    if (a == 0) { cpu_exception(0, "DIV r/m16 除数为 0"); break; }
+                    if (a == 0) { cpu_exception(0, "DIV r/m16 除数为 0"); faulted = true; break; }
                     uint32_t q = dividend / a;
-                    if (q > 0xFFFF) { cpu_exception(0, "DIV r/m16 商溢出（>0xFFFF）"); break; }
+                    if (q > 0xFFFF) { cpu_exception(0, "DIV r/m16 商溢出（>0xFFFF）"); faulted = true; break; }
                     cpu.ax = q & 0xFFFF;
                     cpu.dx = dividend % a; break;
                 }
                 case 7: {
                     // IDIV r/m16：DX:AX / r/m16（有符号）→ 商 AX，余数 DX
                     int32_t dividend = (int32_t)(((uint32_t)cpu.dx << 16) | cpu.ax);
-                    if (a == 0) { cpu_exception(0, "IDIV r/m16 除数为 0"); break; }
+                    if (a == 0) { cpu_exception(0, "IDIV r/m16 除数为 0"); faulted = true; break; }
                     int32_t q = dividend / (int16_t)a;
-                    if (q > 32767 || q < -32768) { cpu_exception(0, "IDIV r/m16 商溢出"); break; }
+                    if (q > 32767 || q < -32768) { cpu_exception(0, "IDIV r/m16 商溢出"); faulted = true; break; }
                     cpu.ax = q & 0xFFFF;
                     cpu.dx = (dividend % (int16_t)a) & 0xFFFF; break;
                 }
             }
+            if (!faulted) { cpu.ip += 2; handle_modrm_ip(modrm); }
             break;
         }
 
@@ -2938,6 +2946,34 @@ void cpu_fault_dump(const char* kind, uint8_t vector, const char* why) {
 	fflush(stderr);
 }
 
+// 计算故障指令长度，供空向量 IRET 恢复桩跳过故障指令使用（仅覆盖常见故障/探测操作码）。
+static uint16_t modrm_disp_len(uint8_t m) {
+	uint8_t mod = (m >> 6) & 0x03;
+	uint8_t rm  = m & 0x07;
+	if (mod == 0) return (rm == 6) ? 2 : 0;   // [disp16] 或 [reg]
+	if (mod == 1) return 1;                   // [reg+disp8]
+	if (mod == 2) return 2;                   // [reg+disp16]
+	return 0;                                 // mod==3：寄存器，无 disp
+}
+
+static uint16_t fault_instr_len(uint16_t cs, uint16_t ip) {
+	uint32_t base = cpu_seg_base(cs);
+	uint8_t op = cpu_mem_read(base + ip);
+	switch (op) {
+		case 0xF6: case 0xF7:                 // GRP3 r/m8 / r/m16
+		case 0x62:                            // BOUND r16, m16&16
+			return 2 + modrm_disp_len(cpu_mem_read(base + ip + 1));
+		case 0x0F:                            // 两字节扩展前缀
+			return 2 + modrm_disp_len(cpu_mem_read(base + ip + 1));
+		case 0xCE:                            // INTO
+		case 0xCC:                            // INT3
+		case 0xF1:                            // INT1 (ICEBP)
+			return 1;
+		default:
+			return 2;                         // 多数含 modrm 的故障指令至少 2 字节
+	}
+}
+
 // 投递异常：按实模式 IVT 走 8086 逻辑。
 // 若异常处理程序内部再出错（in_fault 重入）或向量为空 → 双重故障；
 // 双重故障也投不出去 → 三重故障 → 停机。
@@ -2961,11 +2997,17 @@ void cpu_exception(uint8_t vector, const char* why) {
 		return;
 	}
 
+	// 故障类异常必须返回到“故障指令本身”（符合真实 x86 语义），而非下一条。
+	// 返回地址取当前 CS:IP（指令译码前尚未推进 IP），真实处理例程据此决定如何续跑；
+	// 仅当向量为空（制造模式 POST 探测）走 IRET 恢复桩时，才把返回 IP 跳过故障指令。
+	uint16_t fault_cs = cpu.cs, fault_ip = cpu.ip;
+
 	// 任何异常都输出完整寄存器 dump（不再依赖 debug_mode）
 	cpu_fault_dump("CPU exception", vector, why);
 
 	uint32_t va = (uint32_t)vector * 4;
 	uint16_t o = read_word(0, va), s = read_word(0, va + 2);
+	bool will_stub = (vector <= 7) && ((o | s) == 0);
 	if ((o | s) == 0) {
 		// 制造模式 POST 清空了 IVT 且未安装 INT 0-7；首次遇到空向量时补装恢复桩
 		// （单字节 IRET，桩字节在 UMA 0xD0000），让 DOS 引导期依赖的异常处理能恢复执行。
@@ -2984,7 +3026,12 @@ void cpu_exception(uint8_t vector, const char* why) {
 
 	in_fault = 1;
 	cpu_interrupt(vector);
-	// 处理程序返回到此之前保持 in_fault=1；IRET 会清零。
+	// 空向量恢复桩（IRET）会直接返回到栈上保存的返回地址；为不重入故障指令，
+	// 把该返回 IP 修正为“故障指令下一条”。真实处理例程则由其自身决定返回点。
+	if (will_stub) {
+		uint16_t rip = read_word(cpu.ss, cpu.sp);
+		write_word(cpu.ss, cpu.sp, (uint16_t)(rip + fault_instr_len(fault_cs, fault_ip)));
+	}
 }
 
 // 无效操作码：8086 无法继续解码 → 报告现场并停机
@@ -3129,7 +3176,7 @@ void cpu_interrupt(uint8_t int_num) {
 // 制造模式 POST 会跳过 INT 0-7 的安装；DOS 引导期依赖这些异常向量
 // （AAM 0 做 CPU 探测、BOUND 做边界检查等）。这里在空闲 RAM 内置一个 IRET 桩，
 // 仅给"POST 未安装"的空向量补装，等价于真实 BIOS 的"恢复执行"语义
-// （故障指令已在投递前由 CPU 推进 IP，故 IRET 直接回到下一条）。
+// （故障时返回帧指向故障指令本身，故空向量桩需在投递后把返回 IP 跳过该指令）。
 void cpu_install_exception_stubs(void) {
 	// 桩放在 UMA 中确定空闲的 0xD0000（不属 BIOS/DOS 常规内存，也不在选项 ROM 扫描范围
 	// C0000-C8000 内，POST/早期引导不会改写它）。8 个向量共用这一字节 IRET 桩。

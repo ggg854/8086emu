@@ -9,8 +9,8 @@ typedef struct {
     void        *ctx;      /* 设备私有数据            */
     bus_read_fn  rd;       /* 读端口回调              */
     bus_write_fn wr;       /* 写端口回调              */
-    uint16_t     start;    /* 认领区间起点            */
-    uint16_t     len;      /* 区间长度（端口数）      */
+    uint32_t     start;    /* 认领区间起点            */
+    uint32_t     len;      /* 区间长度（端口数）      */
 } BusDev;
 
 struct Bus {
@@ -28,7 +28,7 @@ Bus *bus_get_global(void) { return &g_bus; }
 
 void bus_register(Bus *bus, const char *name, void *ctx,
                   bus_read_fn rd, bus_write_fn wr,
-                  uint16_t start, uint16_t len) {
+                  uint32_t start, uint32_t len) {
     if (!bus || bus->ndevs >= BUS_MAX_DEVS) return;
     BusDev *d = &bus->devs[bus->ndevs++];
     d->name  = name;
@@ -56,8 +56,9 @@ uint8_t bus_read_port(Bus *bus, uint16_t port) {
     /* 后注册者优先：从表尾向前找第一个覆盖该端口的设备。 */
     for (int i = bus->ndevs - 1; i >= 0; i--) {
         BusDev *d = &bus->devs[i];
-        if (port >= d->start && port < d->start + d->len)
+        if (port >= d->start && port < d->start + d->len) {
             return d->rd(d->ctx, port);
+        }
     }
     if (bus->def_rd) return bus->def_rd(bus->def_ctx, port);
     return 0xFF;   /* 无设备认领：等价于浮空总线，读回 0xFF */

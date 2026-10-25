@@ -492,11 +492,12 @@ void cpu386_execute_opcode(uint8_t opcode) {
 			int16_t idx = (int16_t)*reg16_table[reg];
 			int16_t lo = (int16_t)(cpu_mem_read(ea) | (cpu_mem_read(ea + 1) << 8));
 			int16_t hi = (int16_t)(cpu_mem_read(ea + 2) | (cpu_mem_read(ea + 3) << 8));
-			cpu.ip += 2;
-			handle_modrm_ip(modrm);
 			if (idx < lo || idx > hi) {
 				cpu_exception(EXC_BR, "BOUND 越界（索引超出上下界）");
+				break;
 			}
+			cpu.ip += 2;
+			handle_modrm_ip(modrm);
 			break;
 		}
 

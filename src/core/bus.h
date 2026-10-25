@@ -28,7 +28,7 @@ typedef struct Bus Bus;
 /* 注册一个设备，认领 [start, start+len) 端口区间。后者优先（覆盖前面同区间）。 */
 void bus_register(Bus *bus, const char *name, void *ctx,
                   bus_read_fn rd, bus_write_fn wr,
-                  uint16_t start, uint16_t len);
+                  uint32_t start, uint32_t len);
 
 /* 未命中任何设备时的默认处理（通常读返回 0xFF / 写忽略）。 */
 void bus_set_default(Bus *bus, bus_read_fn rd, bus_write_fn wr, void *ctx);

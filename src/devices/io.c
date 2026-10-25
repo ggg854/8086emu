@@ -1104,18 +1104,11 @@ static void post_fixup_floppy_equip(void) {
         eq = (uint16_t)((eq & ~0x00C0) | ((n - 1) << 6)); // bits6-7 = 台数−1
     }
     write_word(0x0040, 0x0010, eq);
-    fprintf(stderr, "[FIXUP] wrote BDA0x10=%04X 0x90=%02X 0x91=%02X\n", eq, a, b);
 }
 
 // ============================================================
 // 读端口
 // ============================================================
-// ★ 诊断 IOTRACE：直接写文件 iotrace_port.log，GUI 也能抓（事后删）。
-static FILE* iotr_open(void) {
-  static FILE* f = NULL;
-  if (!f) f = fopen("iotrace_port.log", "w");
-  return f;
-}
 // ============================================================
 // I/O 端口读写（经总线 Bus 分发）
 //   CPU 只调用 io_read_port / io_write_port（内部转总线）。
@@ -1130,10 +1123,6 @@ uint8_t io_read_port(uint16_t port) {
 static uint8_t legacy_read(void* ctx, uint16_t port) {
   (void)ctx;
   uint8_t ret = 0;
-  // ★ 诊断 IOTRACE：打印嫌疑端口（DMA/PIT/键盘）的读，定位 XT BIOS 卡死。事后删。
-  static int g_iotr = -1;
-  if (g_iotr < 0) g_iotr = getenv("IOTRACE") ? 1 : 0;
-  bool iotr_r = g_iotr && (port < 0x10 || (port >= 0x40 && port <= 0x43) || (port >= 0x60 && port <= 0x64));
   switch (port) {
     // ---- DMA ----
     case 0x00: case 0x01: case 0x02: case 0x03:
@@ -1397,7 +1386,6 @@ static uint8_t legacy_read(void* ctx, uint16_t port) {
     }
   }
 
-  if (iotr_r) { FILE* f = iotr_open(); if (f) { fprintf(f, "[IO.R] %03X=%02X\n", port, ret); fflush(f); } }
   return ret;
 }
 
@@ -1411,11 +1399,6 @@ void io_write_port(uint16_t port, uint8_t val) {
 
 static void legacy_write(void* ctx, uint16_t port, uint8_t val) {
   (void)ctx;
-  // ★ 诊断 IOTRACE（与读共用开关）
-  static int g_iotw = -1;
-  if (g_iotw < 0) g_iotw = getenv("IOTRACE") ? 1 : 0;
-  bool iotr_w = g_iotw && (port < 0x10 || (port >= 0x40 && port <= 0x43) || (port >= 0x60 && port <= 0x64));
-  if (iotr_w) { FILE* f = iotr_open(); if (f) { fprintf(f, "[IO.W] %03X<=%02X\n", port, val); fflush(f); } }
   switch (port) {
     // ---- DMA ----
     case 0x00: case 0x01: case 0x02: case 0x03:
@@ -1660,7 +1643,6 @@ static void legacy_write(void* ctx, uint16_t port, uint8_t val) {
     case 0x71: {
       uint8_t idx = cmos_index & 0x7F;
       cmos_rtc[idx] = val;
-      if (idx == 0x0E) { io_keyboard_push(0x3B); io_keyboard_push_release(0x3B); }  // DBG: 自动按 F1 推进引导
       // 状态 B（0x0B）写：若使能了某个 RTC 中断（PIE/AE/UIE，位 6/5/4），
       // 模拟"该中断已发生"——置状态 C（0x0C）对应标志并挂一个 IRQ8 待投。
       // AT POST 的 163 自检就是等这次 IRQ8 把 [40:6B] 置 1，缺它就会报 163。
