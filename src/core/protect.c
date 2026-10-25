@@ -390,8 +390,6 @@ void protect_far_ret(bool is_iret, uint16_t imm) {
     uint16_t ret_cs = pop();
     uint16_t new_flags = cpu.flags;
     if (is_iret) new_flags = pop();
-    fprintf(stderr, "[IRET-pm] pe=%d ret_ip=%04X ret_cs=%04X ret_fl=%04X cpl=%d rcpl=%d\n",
-            protect.pe ? 1 : 0, ret_ip, ret_cs, new_flags, protect_cpl(), ret_cs & 3);
 
     SegmentDescriptor d;
     uint32_t tb, tl;
