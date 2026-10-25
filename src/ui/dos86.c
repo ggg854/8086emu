@@ -504,6 +504,8 @@ static gboolean tick(gpointer data) {
 
     static uint16_t last_cs = 0, last_ip = 0;
     static int same_count = 0;
+    static bool fly_warned = false;    // IVT 跑飞：只警告一次
+    static bool loop_warned = false;   // 原地死循环：只警告一次
 
     if (cpu_halted) {
     if (!halt_reported) {
@@ -558,6 +560,7 @@ static gboolean tick(gpointer data) {
         if (cpu_reset_pending) {
             cpu_reset_pending = false;
             cpu_reset();
+            fly_warned = loop_warned = false;   // 复位后允许重新告警
             continue;
         }
 
@@ -567,36 +570,39 @@ static gboolean tick(gpointer data) {
         uint32_t addr = cpu_seg_base(cpu.cs) + cpu.ip;
         uint8_t op = cpu_mem_read(addr);
 
-        // ★ 检测 1：跑到 IVT 区（只警告 + 停 CPU，不退出）
+        // ★ 检测 1：跑到 IVT 区 —— 只警告，不停止 CPU、不退出（整机与键盘保持运行）
         if (cpu.cs == 0x0000 && cpu.ip < 0x0400) {
-            fprintf(stderr, "\n[CPU] Fly: CS=%04X IP=%04X landed in IVT region\n",
-                    cpu.cs, cpu.ip);
-            fprintf(stderr, "  AX=%04X BX=%04X CX=%04X DX=%04X\n",
-                    cpu.ax, cpu.bx, cpu.cx, cpu.dx);
-            fprintf(stderr, "  SI=%04X DI=%04X BP=%04X SP=%04X\n",
-                    cpu.si, cpu.di, cpu.bp, cpu.sp);
-            fprintf(stderr, "  DS=%04X ES=%04X SS=%04X CS=%04X\n",
-                    cpu.ds, cpu.es, cpu.ss, cpu.cs);
-            fprintf(stderr, "  FL=%04X  a20=%d pe=%d\n",
-                    cpu.flags, (int)cpu_a20_enabled, (int)protect.pe);
-            // ★ 打印跳转前的指令（last_cs/last_ip 指向上一条已执行指令），定位"谁跳到了 0:0"
-            {
+            if (!fly_warned) {
+                fly_warned = true;
+                fprintf(stderr, "\n[CPU] WARNING: Fly into IVT region CS=0000 IP=%04X\n",
+                        cpu.ip);
+                fprintf(stderr, "  AX=%04X BX=%04X CX=%04X DX=%04X\n",
+                        cpu.ax, cpu.bx, cpu.cx, cpu.dx);
+                fprintf(stderr, "  SI=%04X DI=%04X BP=%04X SP=%04X\n",
+                        cpu.si, cpu.di, cpu.bp, cpu.sp);
+                fprintf(stderr, "  DS=%04X ES=%04X SS=%04X CS=%04X\n",
+                        cpu.ds, cpu.es, cpu.ss, cpu.cs);
+                fprintf(stderr, "  FL=%04X  a20=%d pe=%d\n",
+                        cpu.flags, (int)cpu_a20_enabled, (int)protect.pe);
+                // ★ 打印跳转前的指令（last_cs/last_ip 指向上一条已执行指令），定位"谁跳到了 0:0"
                 uint32_t pa = ((uint32_t)last_cs << 4) | last_ip;
                 fprintf(stderr, "  PREV CS:IP=%04X:%04X bytes:", last_cs, last_ip);
                 for (int k = 0; k < 8; k++) fprintf(stderr, " %02X", cpu_mem_read(pa + k));
                 fprintf(stderr, "\n");
+                emu_trace("FLY CS=%04X IP=%04X prev=%04X:%04X AX=%04X BX=%04X CX=%04X DX=%04X FL=%04X\n",
+                          cpu.cs, cpu.ip, last_cs, last_ip, cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.flags);
             }
-            emu_trace("FLY CS=%04X IP=%04X prev=%04X:%04X AX=%04X BX=%04X CX=%04X DX=%04X FL=%04X\n",
-                      cpu.cs, cpu.ip, last_cs, last_ip, cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.flags);
-            cpu_running = false;
-            break;   // ★ 跳出 while，不 return
+            // 不 cpu_running=false、不 break：让客机继续从 0000:0000 取指执行（与真实机器一致，
+            // 通常 IVT 0:0 处是 BIOS 的重启/ROM-BASIC 跳转），整机不冻结、键盘照常可用。
+            // fly_warned 只在首次触发时置位，整段会话只警告一次（避免引导失败重启循环刷屏）。
         }
 
-        // ★ 检测 2：CS:IP 不变超过 50 万次（只警告 + 停 CPU，不退出）
+        // ★ 检测 2：CS:IP 不变超过 50 万次 —— 只警告，不停止 CPU、不退出
         if (cpu.cs == last_cs && cpu.ip == last_ip) {
             same_count++;
-            if (same_count > 500000) {
-                printf("\n[CPU] Loop：CS=%04X IP=%04X\n",
+            if (same_count > 500000 && !loop_warned) {
+                loop_warned = true;
+                printf("\n[CPU] WARNING: Loop at CS=%04X IP=%04X\n",
                        cpu.cs, cpu.ip);
                 printf("  Byte: %02X %02X %02X %02X %02X\n",
                        cpu_mem_read(addr), cpu_mem_read(addr + 1),
@@ -611,13 +617,14 @@ static gboolean tick(gpointer data) {
                 emu_trace("LOOP CS=%04X IP=%04X byte=%02X %02X %02X AX=%04X BX=%04X CX=%04X DX=%04X FL=%04X\n",
                           cpu.cs, cpu.ip, cpu_mem_read(addr), cpu_mem_read(addr + 1),
                           cpu_mem_read(addr + 2), cpu.ax, cpu.bx, cpu.cx, cpu.dx, cpu.flags);
-                cpu_running = false;
-                break;   // ★ 跳出 while，不 return
             }
+            // 不 cpu_running=false、不 break：客机继续在原地死循环（真实机器也会这样占满 CPU），
+            // 整机与键盘保持运行，可在菜单里手动复位
         } else {
             last_cs = cpu.cs;
             last_ip = cpu.ip;
             same_count = 0;
+            loop_warned = false;
         }
 
         // OUT 周期特判（周期来自 cpu.c 的表；0x3F8 不再特判成控制台输出，
